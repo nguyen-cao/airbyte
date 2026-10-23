@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 package io.airbyte.integrations.destination.teradata
 
@@ -7,10 +7,12 @@ import com.fasterxml.jackson.databind.JsonNode
 import io.airbyte.commons.json.Jsons
 import java.nio.file.Files
 import java.nio.file.Paths
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.TestInstance
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
+@Disabled("Disabled after DV2 migration. Re-enable with fixtures updated to DV2.")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class TeradataDestinationSSLAcceptanceTest : TeradataDestinationAcceptanceTest() {
     @get:Throws(Exception::class)

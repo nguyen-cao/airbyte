@@ -1,21 +1,24 @@
 ---
-products: oss-enterprise, cloud-teams
+products: cloud-plus
 ---
 
-# Single Sign-On (SSO)
+# Single sign on (SSO)
 
 import Tabs from "@theme/Tabs";
 import TabItem from "@theme/TabItem";
+import CaptureHarFile from '../_partials/_capture-har-file.md';
 
-Single Sign-On (SSO) allows you to enable logging into Airbyte using your existing Identity Provider (IdP) like Okta or Active Directory.
+Use Open ID Connect (OIDC) to log into Airbyte using an Identity Provider (IdP) like Okta or Entra ID/Active Directory.
 
-SSO is available in Airbyte Enterprise and on Cloud with the Teams add-on. [Talk to us](https://airbyte.com/company/talk-to-sales) if you are interested in setting up SSO for your organization.
+SCIM provisioning is an add-on to SSO. After you set up SSO, see [SCIM provisioning](scim) to configure user and group provisioning.
 
-If you are an existing Cloud Teams customer and want to enable SSO for your Organization, please [submit a Support Ticket](https://support.airbyte.com/hc/en-us/requests/new) to begin the process.
+:::note
+SSO isn't available on the Cloud Standard plan. If your Standard organization already uses SSO, you keep it as long as you remain a paying customer. To compare plans, see [Airbyte's pricing page](https://airbyte.com/pricing).
+:::
 
-## Set up
+## Set up single sign on
 
-You can find setup explanations for all our supported Identity Providers on the following subpages:
+Administrators must set up SSO before your organization can use it. The steps differ slightly depending on which IdP you use and whether you're on the Cloud or Self-Managed version of Airbyte. To get started, choose your identity provider below.
 
 ```mdx-code-block
 import DocCardList from '@theme/DocCardList';
@@ -23,17 +26,51 @@ import DocCardList from '@theme/DocCardList';
 <DocCardList />
 ```
 
-## Logging in
+## Log into Airbyte using single sign on
 
-<Tabs groupId="cloud-hosted">
-  <TabItem value="cloud" label="Cloud">
-    Once we inform you that you’re all set up, you can log into Airbyte using SSO by visiting [cloud.airbyte.com/sso](https://cloud.airbyte.com/sso) or select the **Continue with SSO** option on the login screen.
-    
-    Specify your _company identifier_ and hit “Continue with SSO”. You’ll be forwarded to your IdP's login page (e.g. Okta login page). Log into your work account and you’ll be forwarded back to Airbyte Cloud and be logged in.
-    
-    *Note:* you were already logged into your company’s Okta account you might not see any login screen and directly get forwarded back to Airbyte Cloud.
-  </TabItem>
-  <TabItem value="self-managed" label="Self-Managed">
-    Accessing your self hosted Airbyte will automatically forward you to your IdP's login page (e.g. Okta login page). Log into your work account and you’ll be forwarded back to your Airbyte and be logged in.
-  </TabItem>
+<Tabs groupId="product">
+<TabItem value="cloud" label="Cloud">
+
+1. Visit [Airbyte Cloud](https://cloud.airbyte.com) and click **Continue with SSO**.
+
+2. Type your **Company identifier**, then click **Continue with SSO**. Airbyte forwards you to your identity provider's login page. 
+
+3. Log into your work account. Your IdP forwards you back to Airbyte Cloud, which logs you in.
+
+</TabItem>
+<TabItem value="self-managed" label="Self-Managed">
+
+1. Access your self-managed instance of Airbyte at the URL your organization has set up. Airbyte automatically forwards you to your identity provider's login page.
+
+2. Log into your IdP. Your IdP forwards you back to Airbyte, which logs you in.
+
+</TabItem>
 </Tabs>
+
+:::note
+If you were already logged into your company’s IdP somewhere else, you might not see a login screen. In this case, Airbyte forwards you directly to Airbyte's logged-in area.
+:::
+
+## Troubleshooting
+
+If you contact [Airbyte Support](https://support.airbyte.com/) about an SSO login problem, including a HAR file and the details of the relevant network requests helps Airbyte diagnose your issue and turn around a resolution faster.
+
+### Capture a HAR file
+
+<CaptureHarFile />
+
+### Find the authentication requests
+
+SSO login sends your browser through a series of redirects between Airbyte and your identity provider. Capturing these requests shows where the login flow breaks down.
+
+1. Open developer tools and click the **Network** tab, following the steps above to capture requests.
+
+2. Select **Preserve log** (**Persist Logs** in Firefox). This is important for SSO, because the login flow redirects across multiple pages and domains, and requests are otherwise cleared on each redirect.
+
+3. Reproduce the problem by attempting to log in with SSO.
+
+4. Look for requests to your identity provider (for example, Okta or Entra ID) and to Airbyte's authentication endpoints, and for any request that returns a `4xx` or `5xx` status.
+
+5. Click a failing request and review the **Response** and **Preview** tabs for error messages, and the **Headers** tab for the request details.
+
+6. Include these requests, along with the HAR file, in your support submission.

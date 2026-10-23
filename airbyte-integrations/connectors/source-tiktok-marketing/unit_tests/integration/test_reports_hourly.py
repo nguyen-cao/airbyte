@@ -2,17 +2,21 @@
 
 import json
 from unittest import TestCase
-
-from advetiser_slices import mock_advertisers_slices
-from config_builder import ConfigBuilder
-from source_tiktok_marketing import SourceTiktokMarketing
+from unittest.mock import patch
 
 from airbyte_cdk.models import SyncMode
+from airbyte_cdk.sources.declarative.requesters.error_handlers.backoff_strategies.constant_backoff_strategy import (
+    ConstantBackoffStrategy,
+)
 from airbyte_cdk.test.catalog_builder import CatalogBuilder
 from airbyte_cdk.test.entrypoint_wrapper import read
 from airbyte_cdk.test.mock_http import HttpMocker, HttpRequest, HttpResponse
 from airbyte_cdk.test.mock_http.response_builder import find_template
 from airbyte_cdk.test.state_builder import StateBuilder
+
+from ..conftest import get_source
+from .advetiser_slices import mock_advertisers_slices
+from .config_builder import ConfigBuilder
 
 
 EMPTY_LIST_RESPONSE = {"code": 0, "message": "ok", "data": {"list": []}}
@@ -77,6 +81,14 @@ class TestAdsReportHourly(TestCase):
         "cost_per_total_sales_lead",
         "cost_per_total_app_event_add_to_cart",
         "total_app_event_add_to_cart",
+        "engaged_view",
+        "engagements",
+        "paid_engaged_view",
+        "engaged_view_through_conversions",
+        "paid_engagement_engaged_view",
+        "engaged_view_15s",
+        "paid_engaged_view_15s",
+        "paid_engagement_engaged_view_15s",
         "spend",
         "cpc",
         "cpm",
@@ -165,10 +177,50 @@ class TestAdsReportHourly(TestCase):
         mock_advertisers_slices(http_mocker, self.config())
         self.mock_response(http_mocker)
 
-        output = read(SourceTiktokMarketing(config=self.config(), catalog=None, state=None), self.config(), self.catalog())
+        output = read(get_source(config=self.config(), state=None), self.config(), self.catalog())
         assert len(output.records) == 2
         assert output.records[0].record.data.get("ad_id") is not None
         assert output.records[0].record.data.get("stat_time_hour") is not None
+
+    @HttpMocker()
+    def test_retries_51002(self, http_mocker: HttpMocker):
+        mock_advertisers_slices(http_mocker, self.config())
+        query_params = {
+            "service_type": "AUCTION",
+            "report_type": "BASIC",
+            "data_level": "AUCTION_AD",
+            "dimensions": '["ad_id", "stat_time_hour"]',
+            "metrics": str(self.metrics).replace("'", '"'),
+            "start_date": self.config()["start_date"],
+            "end_date": self.config()["start_date"],
+            "page_size": 1000,
+            "advertiser_id": self.advertiser_id,
+        }
+        http_mocker.get(
+            HttpRequest(
+                url=f"https://business-api.tiktok.com/open_api/v1.3/report/integrated/get/",
+                query_params=query_params,
+            ),
+            [
+                HttpResponse(body=json.dumps({"code": 51002, "message": "internal error"}), status_code=200),
+                HttpResponse(body=json.dumps(find_template(self.stream_name, __file__)), status_code=200),
+            ],
+        )
+
+        query_params["start_date"] = query_params["end_date"] = self.config()["end_date"]
+        http_mocker.get(
+            HttpRequest(
+                url=f"https://business-api.tiktok.com/open_api/v1.3/report/integrated/get/",
+                query_params=query_params,
+            ),
+            HttpResponse(body=json.dumps(EMPTY_LIST_RESPONSE), status_code=200),
+        )
+
+        with patch.object(ConstantBackoffStrategy, "backoff_time", return_value=0):
+            output = read(get_source(config=self.config(), state=None), self.config(), self.catalog())
+
+        assert len(output.records) == 2
+        assert not output.errors
 
     @HttpMocker()
     def test_read_with_state(self, http_mocker: HttpMocker):
@@ -176,7 +228,7 @@ class TestAdsReportHourly(TestCase):
         self.mock_response(http_mocker)
 
         output = read(
-            source=SourceTiktokMarketing(config=self.config(), catalog=None, state=self.state(cursor=self.cursor)),
+            source=get_source(config=self.config(), state=self.state(cursor=self.cursor)),
             config=self.config(),
             catalog=self.catalog(sync_mode=SyncMode.incremental),
             state=self.state(cursor=self.cursor),
@@ -193,13 +245,13 @@ class TestAdsReportHourly(TestCase):
         self.mock_response(http_mocker)
 
         output = read(
-            source=SourceTiktokMarketing(config=self.config(), catalog=None, state=self.state(cursor=self.legacy_cursor)),
+            source=get_source(config=self.config(), state=self.state(cursor=self.legacy_cursor)),
             config=self.config(),
             catalog=self.catalog(sync_mode=SyncMode.incremental),
             state=self.state(cursor=self.legacy_cursor),
         )
 
-        assert len(output.records) == 1
+        assert len(output.records) == 2
         assert output.state_messages[1].state.stream.stream_state.states == [
             {"cursor": {"stat_time_hour": self.legacy_cursor}, "partition": {"advertiser_id": self.advertiser_id, "parent_slice": {}}}
         ]
@@ -210,7 +262,7 @@ class TestAdsReportHourly(TestCase):
         self.mock_response(http_mocker, include_deleted=True)
 
         output = read(
-            SourceTiktokMarketing(config=self.config(include_deleted=True), catalog=None, state=None),
+            get_source(config=self.config(include_deleted=True), state=None),
             self.config(include_deleted=True),
             self.catalog(),
         )
@@ -331,7 +383,7 @@ class TestAdGroupsReportsHourly(TestCase):
             HttpResponse(body=json.dumps(EMPTY_LIST_RESPONSE), status_code=200),
         )
 
-        output = read(SourceTiktokMarketing(config=self.config(), catalog=None, state=None), self.config(), self.catalog())
+        output = read(get_source(config=self.config(), state=None), self.config(), self.catalog())
         assert len(output.records) == 2
         assert output.records[0].record.data.get("adgroup_id") is not None
         assert output.records[0].record.data.get("stat_time_hour") is not None
@@ -377,13 +429,13 @@ class TestAdGroupsReportsHourly(TestCase):
         )
 
         output = read(
-            source=SourceTiktokMarketing(config=self.config(), catalog=None, state=self.state()),
+            source=get_source(config=self.config(), state=self.state()),
             config=self.config(),
             catalog=self.catalog(sync_mode=SyncMode.incremental),
             state=self.state(),
         )
 
-        assert len(output.records) == 1
+        assert len(output.records) == 2
         assert output.state_messages[1].state.stream.stream_state.states == [
             {"cursor": {"stat_time_hour": self.cursor}, "partition": {"advertiser_id": self.advertiser_id, "parent_slice": {}}}
         ]
@@ -421,7 +473,7 @@ class TestAdGroupsReportsHourly(TestCase):
         )
 
         output = read(
-            SourceTiktokMarketing(config=self.config(include_deleted=True), catalog=None, state=None),
+            get_source(config=self.config(include_deleted=True), state=None),
             self.config(include_deleted=True),
             self.catalog(),
         )
@@ -527,7 +579,7 @@ class TestAdvertisersReportsHourly(TestCase):
         mock_advertisers_slices(http_mocker, self.config())
         self.mock_response(http_mocker)
 
-        output = read(SourceTiktokMarketing(config=self.config(), catalog=None, state=None), self.config(), self.catalog())
+        output = read(get_source(config=self.config(), state=None), self.config(), self.catalog())
         assert len(output.records) == 2
         assert output.records[0].record.data.get("advertiser_id") is not None
         assert output.records[0].record.data.get("stat_time_hour") is not None
@@ -538,13 +590,13 @@ class TestAdvertisersReportsHourly(TestCase):
         self.mock_response(http_mocker)
 
         output = read(
-            source=SourceTiktokMarketing(config=self.config(), catalog=None, state=self.state()),
+            source=get_source(config=self.config(), state=self.state()),
             config=self.config(),
             catalog=self.catalog(sync_mode=SyncMode.incremental),
             state=self.state(),
         )
 
-        assert len(output.records) == 1
+        assert len(output.records) == 2
         assert output.state_messages[1].state.stream.stream_state.states == [
             {"cursor": {"stat_time_hour": self.cursor}, "partition": {"advertiser_id": self.advertiser_id, "parent_slice": {}}}
         ]
@@ -645,7 +697,7 @@ class TestCampaignsReportsHourly(TestCase):
         mock_advertisers_slices(http_mocker, self.config())
         self.mock_response(http_mocker)
 
-        output = read(SourceTiktokMarketing(config=self.config(), catalog=None, state=None), self.config(), self.catalog())
+        output = read(get_source(config=self.config(), state=None), self.config(), self.catalog())
         assert len(output.records) == 2
         assert output.records[0].record.data.get("campaign_id") is not None
         assert output.records[0].record.data.get("stat_time_hour") is not None
@@ -656,13 +708,13 @@ class TestCampaignsReportsHourly(TestCase):
         self.mock_response(http_mocker)
 
         output = read(
-            source=SourceTiktokMarketing(config=self.config(), catalog=None, state=self.state()),
+            source=get_source(config=self.config(), state=self.state()),
             config=self.config(),
             catalog=self.catalog(sync_mode=SyncMode.incremental),
             state=self.state(),
         )
 
-        assert len(output.records) == 1
+        assert len(output.records) == 2
         assert output.state_messages[1].state.stream.stream_state.states == [
             {"cursor": {"stat_time_hour": self.cursor}, "partition": {"advertiser_id": self.advertiser_id, "parent_slice": {}}}
         ]
@@ -673,7 +725,7 @@ class TestCampaignsReportsHourly(TestCase):
         self.mock_response(http_mocker, include_deleted=True)
 
         output = read(
-            SourceTiktokMarketing(config=self.config(include_deleted=True), catalog=None, state=None),
+            get_source(config=self.config(include_deleted=True), state=None),
             self.config(include_deleted=True),
             self.catalog(),
         )

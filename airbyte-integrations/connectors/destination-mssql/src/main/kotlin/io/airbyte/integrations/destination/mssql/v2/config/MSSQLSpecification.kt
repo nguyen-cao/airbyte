@@ -1,11 +1,14 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.mssql.v2.config
 
+import com.fasterxml.jackson.annotation.JsonGetter
+import com.fasterxml.jackson.annotation.JsonIgnore
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.annotation.JsonPropertyDescription
+import com.fasterxml.jackson.annotation.JsonSetter
 import com.fasterxml.jackson.annotation.JsonSubTypes
 import com.fasterxml.jackson.annotation.JsonTypeInfo
 import com.kjetland.jackson.jsonSchema.annotations.JsonSchemaDescription
@@ -14,7 +17,10 @@ import com.kjetland.jackson.jsonSchema.annotations.JsonSchemaTitle
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings
 import io.airbyte.cdk.command.ConfigurationSpecification
 import io.airbyte.cdk.load.spec.DestinationSpecificationExtension
+import io.airbyte.cdk.ssh.MicronautPropertiesFriendlySshTunnelMethodConfigurationSpecification
+import io.airbyte.cdk.ssh.SshTunnelMethodConfiguration
 import io.airbyte.protocol.models.v0.DestinationSyncMode
+import io.micronaut.context.annotation.ConfigurationBuilder
 import jakarta.inject.Singleton
 
 @Singleton
@@ -41,7 +47,7 @@ class MSSQLSpecification : ConfigurationSpecification(), LoadTypeSpecification {
 
     @get:JsonSchemaTitle("Default Schema")
     @get:JsonPropertyDescription(
-        "The default schema tables are written to if the source does not specify a namespace. The usual value for this field is \"public\"."
+        "The default schema tables are written to if the source does not specify a namespace. The usual value for this field is \"public\".",
     )
     @get:JsonProperty("schema")
     @get:JsonSchemaInject(json = """{"examples":["public"],"default":"public","order":3}""")
@@ -61,7 +67,7 @@ class MSSQLSpecification : ConfigurationSpecification(), LoadTypeSpecification {
 
     @get:JsonSchemaTitle("JDBC URL Params")
     @get:JsonPropertyDescription(
-        "Additional properties to pass to the JDBC URL string when connecting to the database formatted as 'key=value' pairs separated by the symbol '&'. (example: key1=value1&key2=value2&key3=value3)."
+        "Additional properties to pass to the JDBC URL string when connecting to the database formatted as 'key=value' pairs separated by the symbol '&'. (example: key1=value1&key2=value2&key3=value3).",
     )
     @get:JsonProperty("jdbc_url_params")
     @get:JsonSchemaInject(json = """{"order":6}""")
@@ -69,7 +75,7 @@ class MSSQLSpecification : ConfigurationSpecification(), LoadTypeSpecification {
 
     @get:JsonSchemaTitle("SSL Method")
     @get:JsonPropertyDescription(
-        "The encryption method which is used to communicate with the database."
+        "The encryption method which is used to communicate with the database.",
     )
     @get:JsonProperty("ssl_method")
     @get:JsonSchemaInject(json = """{"order":7}""")
@@ -78,6 +84,27 @@ class MSSQLSpecification : ConfigurationSpecification(), LoadTypeSpecification {
     @get:JsonProperty("load_type")
     @get:JsonSchemaInject(json = """{"always_show": true,"order":8}""")
     override val loadType: LoadType = InsertLoadSpecification()
+
+    @JsonIgnore
+    @ConfigurationBuilder(configurationPrefix = "tunnel_method")
+    val tunnelMethod = MicronautPropertiesFriendlySshTunnelMethodConfigurationSpecification()
+
+    @JsonIgnore var tunnelMethodJson: SshTunnelMethodConfiguration? = null
+
+    @JsonSetter("tunnel_method")
+    fun setTunnelMethodValue(value: SshTunnelMethodConfiguration?) {
+        tunnelMethodJson = value
+    }
+
+    @JsonGetter("tunnel_method")
+    @JsonSchemaTitle("SSH Tunnel Method")
+    @JsonPropertyDescription(
+        "Whether to initiate an SSH tunnel before connecting to the database," +
+            " and if so, which kind of authentication to use.",
+    )
+    @JsonSchemaInject(json = """{"order":5}""")
+    fun getTunnelMethodValue(): SshTunnelMethodConfiguration? =
+        tunnelMethodJson ?: tunnelMethod.asSshTunnelMethod()
 }
 
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "name")
@@ -96,17 +123,19 @@ class Unencrypted : EncryptionMethod {
     companion object {
         const val NAME = "unencrypted"
     }
+
     override val name: String = NAME
 }
 
 @JsonSchemaTitle("Encrypted (trust server certificate)")
 @JsonSchemaDescription(
-    "Use the certificate provided by the server without verification. (For testing purposes only!)"
+    "Use the certificate provided by the server without verification. (For testing purposes only!)",
 )
 class EncryptedTrust : EncryptionMethod {
     companion object {
         const val NAME = "encrypted_trust_server_certificate"
     }
+
     override val name: String = NAME
 }
 
@@ -125,7 +154,7 @@ class EncryptedVerify(
     val trustStorePassword: String? = null,
     @get:JsonSchemaTitle("Host Name In Certificate")
     @get:JsonPropertyDescription(
-        "Specifies the host name of the server. The value of this property must match the subject property of the certificate."
+        "Specifies the host name of the server. The value of this property must match the subject property of the certificate.",
     )
     @get:JsonProperty("hostNameInCertificate")
     @get:JsonSchemaInject(json = """{"order":3}""")
@@ -134,6 +163,7 @@ class EncryptedVerify(
     companion object {
         const val NAME = "encrypted_verify_certificate"
     }
+
     override val name: String = NAME
 }
 
@@ -144,7 +174,7 @@ class MSSQLSpecificationExtension : DestinationSpecificationExtension {
         listOf(
             DestinationSyncMode.OVERWRITE,
             DestinationSyncMode.APPEND,
-            DestinationSyncMode.APPEND_DEDUP
+            DestinationSyncMode.APPEND_DEDUP,
         )
     override val supportsIncremental = true
 }

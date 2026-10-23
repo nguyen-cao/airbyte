@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.dev_null
@@ -66,7 +66,7 @@ class DevNullConfigurationFactory :
                                                     .toInt(),
                                             logEvery =
                                                 pojo.testDestination.loggingConfig.nthEntryToLog,
-                                        )
+                                        ),
                                 )
                             }
                             is RandomSamplingConfig -> {
@@ -78,8 +78,9 @@ class DevNullConfigurationFactory :
                                                     .toInt(),
                                             sampleRate =
                                                 pojo.testDestination.loggingConfig.samplingRatio,
-                                            seed = pojo.testDestination.loggingConfig.seed?.toLong()
-                                        )
+                                            seed =
+                                                pojo.testDestination.loggingConfig.seed?.toLong(),
+                                        ),
                                 )
                             }
                         }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.bigquery
@@ -30,8 +30,8 @@ import io.airbyte.cdk.load.util.Jsons
 import io.airbyte.cdk.load.util.deserializeToNode
 import io.airbyte.integrations.destination.bigquery.spec.BigqueryConfigurationFactory
 import io.airbyte.integrations.destination.bigquery.spec.BigquerySpecification
-import io.airbyte.integrations.destination.bigquery.typing_deduping.BigqueryFinalTableNameGenerator
-import io.airbyte.integrations.destination.bigquery.typing_deduping.BigqueryRawTableNameGenerator
+import io.airbyte.integrations.destination.bigquery.write.typing_deduping.BigqueryFinalTableNameGenerator
+import io.airbyte.integrations.destination.bigquery.write.typing_deduping.BigqueryRawTableNameGenerator
 import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange
 import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange.Reason
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -43,15 +43,16 @@ private val logger = KotlinLogging.logger {}
 object BigqueryRawTableDataDumper : DestinationDataDumper {
     override fun dumpRecords(
         spec: ConfigurationSpecification,
-        stream: DestinationStream
+        stream: DestinationStream,
     ): List<OutputRecord> {
         val config = BigqueryConfigurationFactory().make(spec as BigquerySpecification)
         val bigquery = BigqueryBeansFactory().getBigqueryClient(config)
 
         val (_, rawTableName) =
-            BigqueryRawTableNameGenerator(config).getTableName(stream.descriptor)
+            BigqueryRawTableNameGenerator(config).getTableName(stream.mappedDescriptor)
 
-        return bigquery.getTable(TableId.of(config.rawTableDataset, rawTableName))?.let { table ->
+        return bigquery.getTable(TableId.of(config.internalTableDataset, rawTableName))?.let { table
+            ->
             val bigquerySchema = table.getDefinition<StandardTableDefinition>().schema!!
             table.list(bigquerySchema).iterateAll().map { row ->
                 OutputRecord(
@@ -72,7 +73,7 @@ object BigqueryRawTableDataDumper : DestinationDataDumper {
         }
             ?: run {
                 logger.warn {
-                    "Raw table does not exist: ${config.rawTableDataset}.$rawTableName. Returning empty list."
+                    "Raw table does not exist: ${config.internalTableDataset}.$rawTableName. Returning empty list."
                 }
                 emptyList()
             }
@@ -80,7 +81,7 @@ object BigqueryRawTableDataDumper : DestinationDataDumper {
 
     override fun dumpFile(
         spec: ConfigurationSpecification,
-        stream: DestinationStream
+        stream: DestinationStream,
     ): Map<String, String> {
         throw NotImplementedError("Bigquery doesn't support file transfer")
     }
@@ -89,13 +90,13 @@ object BigqueryRawTableDataDumper : DestinationDataDumper {
 object BigqueryFinalTableDataDumper : DestinationDataDumper {
     override fun dumpRecords(
         spec: ConfigurationSpecification,
-        stream: DestinationStream
+        stream: DestinationStream,
     ): List<OutputRecord> {
         val config = BigqueryConfigurationFactory().make(spec as BigquerySpecification)
         val bigquery = BigqueryBeansFactory().getBigqueryClient(config)
 
         val (datasetName, finalTableName) =
-            BigqueryFinalTableNameGenerator(config).getTableName(stream.descriptor)
+            BigqueryFinalTableNameGenerator(config).getTableName(stream.mappedDescriptor)
 
         return bigquery.getTable(TableId.of(datasetName, finalTableName))?.let { table ->
             val bigquerySchema = table.getDefinition<StandardTableDefinition>().schema!!
@@ -105,34 +106,33 @@ object BigqueryFinalTableDataDumper : DestinationDataDumper {
                         .filter { field -> !Meta.COLUMN_NAMES.contains(field.name) }
                         .associateTo(linkedMapOf()) { field ->
                             val value: FieldValue = row[field.name]
-                            val airbyteValue =
-                                value.mapNotNull {
-                                    when (field.type) {
-                                        LegacySQLTypeName.BOOLEAN -> BooleanValue(it.booleanValue)
-                                        LegacySQLTypeName.BIGNUMERIC -> NumberValue(it.numericValue)
-                                        LegacySQLTypeName.FLOAT ->
-                                            NumberValue(BigDecimal(it.doubleValue))
-                                        LegacySQLTypeName.NUMERIC -> NumberValue(it.numericValue)
-                                        LegacySQLTypeName.INTEGER -> IntegerValue(it.longValue)
-                                        LegacySQLTypeName.STRING -> StringValue(it.stringValue)
-                                        // TODO check these
-                                        LegacySQLTypeName.DATE -> DateValue(it.stringValue)
-                                        LegacySQLTypeName.DATETIME ->
-                                            TimestampWithoutTimezoneValue(it.stringValue)
-                                        LegacySQLTypeName.TIME ->
-                                            TimeWithoutTimezoneValue(it.stringValue)
-                                        LegacySQLTypeName.TIMESTAMP ->
-                                            TimestampWithTimezoneValue(
-                                                it.timestampInstant.atOffset(ZoneOffset.UTC)
-                                            )
-                                        LegacySQLTypeName.JSON ->
-                                            it.stringValue.deserializeToNode().toAirbyteValue()
-                                        else ->
-                                            throw UnsupportedOperationException(
-                                                "Bigquery data dumper doesn't know how to dump type ${field.type} with value $it"
-                                            )
-                                    }
+                            val airbyteValue = value.mapNotNull {
+                                when (field.type) {
+                                    LegacySQLTypeName.BOOLEAN -> BooleanValue(it.booleanValue)
+                                    LegacySQLTypeName.BIGNUMERIC -> NumberValue(it.numericValue)
+                                    LegacySQLTypeName.FLOAT ->
+                                        NumberValue(BigDecimal(it.doubleValue))
+                                    LegacySQLTypeName.NUMERIC -> NumberValue(it.numericValue)
+                                    LegacySQLTypeName.INTEGER -> IntegerValue(it.longValue)
+                                    LegacySQLTypeName.STRING -> StringValue(it.stringValue)
+                                    // TODO check these
+                                    LegacySQLTypeName.DATE -> DateValue(it.stringValue)
+                                    LegacySQLTypeName.DATETIME ->
+                                        TimestampWithoutTimezoneValue(it.stringValue)
+                                    LegacySQLTypeName.TIME ->
+                                        TimeWithoutTimezoneValue(it.stringValue)
+                                    LegacySQLTypeName.TIMESTAMP ->
+                                        TimestampWithTimezoneValue(
+                                            it.timestampInstant.atOffset(ZoneOffset.UTC),
+                                        )
+                                    LegacySQLTypeName.JSON ->
+                                        it.stringValue.deserializeToNode().toAirbyteValue()
+                                    else ->
+                                        throw UnsupportedOperationException(
+                                            "Bigquery data dumper doesn't know how to dump type ${field.type} with value $it",
+                                        )
                                 }
+                            }
                             field.name to (airbyteValue ?: NullValue)
                         }
                 OutputRecord(
@@ -156,7 +156,7 @@ object BigqueryFinalTableDataDumper : DestinationDataDumper {
 
     override fun dumpFile(
         spec: ConfigurationSpecification,
-        stream: DestinationStream
+        stream: DestinationStream,
     ): Map<String, String> {
         throw NotImplementedError("Bigquery doesn't support file transfer")
     }

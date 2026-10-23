@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.data
@@ -19,8 +19,12 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.OffsetDateTime
 import java.time.OffsetTime
+import java.time.ZonedDateTime
 
 sealed interface AirbyteValue {
+    val airbyteType: AirbyteType
+        get() = airbyteTypeOf(this)
+
     companion object {
         fun from(value: Any?): AirbyteValue =
             when (value) {
@@ -35,6 +39,7 @@ sealed interface AirbyteValue {
                 is BigDecimal -> NumberValue(value)
                 is LocalDate -> DateValue(value)
                 is OffsetDateTime -> TimestampWithTimezoneValue(value)
+                is ZonedDateTime -> TimestampWithTimezoneValue(value.toOffsetDateTime())
                 is LocalDateTime -> TimestampWithoutTimezoneValue(value)
                 is OffsetTime -> TimeWithTimezoneValue(value)
                 is LocalTime -> TimeWithoutTimezoneValue(value)
@@ -43,8 +48,26 @@ sealed interface AirbyteValue {
                 is List<*> -> ArrayValue.from(value)
                 else ->
                     throw IllegalArgumentException(
-                        "Unrecognized value (${value.javaClass.name}: $value"
+                        "Unrecognized value (${value.javaClass.name}: $value",
                     )
+            }
+
+        fun airbyteTypeOf(value: AirbyteValue): AirbyteType =
+            when (value) {
+                // ArrayType requires the type of the object which we do not convey
+                is ArrayValue -> StringType
+                is BooleanValue -> BooleanType
+                is DateValue -> DateType
+                is IntegerValue -> IntegerType
+                // Null is awkward because the value doesn't track the actual type information
+                is NullValue -> StringType
+                is NumberValue -> NumberType
+                is ObjectValue -> ObjectTypeWithoutSchema
+                is StringValue -> StringType
+                is TimeWithTimezoneValue -> TimeTypeWithTimezone
+                is TimeWithoutTimezoneValue -> TimeTypeWithoutTimezone
+                is TimestampWithTimezoneValue -> TimestampTypeWithTimezone
+                is TimestampWithoutTimezoneValue -> TimestampTypeWithoutTimezone
             }
     }
 }
@@ -75,6 +98,7 @@ value class BooleanValue(val value: Boolean) : AirbyteValue, Comparable<BooleanV
 @JvmInline
 value class IntegerValue(val value: BigInteger) : AirbyteValue, Comparable<IntegerValue> {
     constructor(value: Long) : this(BigInteger.valueOf(value))
+
     override fun compareTo(other: IntegerValue): Int = value.compareTo(other.value)
 }
 
@@ -86,7 +110,9 @@ value class NumberValue(val value: BigDecimal) : AirbyteValue, Comparable<Number
 @JvmInline
 value class DateValue(val value: LocalDate) : AirbyteValue, Comparable<DateValue> {
     constructor(date: String) : this(LocalDate.parse(date))
+
     override fun compareTo(other: DateValue): Int = value.compareTo(other.value)
+
     @JsonValue fun toJson() = value.toString()
 }
 
@@ -94,7 +120,9 @@ value class DateValue(val value: LocalDate) : AirbyteValue, Comparable<DateValue
 value class TimestampWithTimezoneValue(val value: OffsetDateTime) :
     AirbyteValue, Comparable<TimestampWithTimezoneValue> {
     constructor(timestamp: String) : this(OffsetDateTime.parse(timestamp))
+
     override fun compareTo(other: TimestampWithTimezoneValue): Int = value.compareTo(other.value)
+
     @JsonValue fun toJson() = value.toString()
 }
 
@@ -102,7 +130,9 @@ value class TimestampWithTimezoneValue(val value: OffsetDateTime) :
 value class TimestampWithoutTimezoneValue(val value: LocalDateTime) :
     AirbyteValue, Comparable<TimestampWithoutTimezoneValue> {
     constructor(timestamp: String) : this(LocalDateTime.parse(timestamp))
+
     override fun compareTo(other: TimestampWithoutTimezoneValue): Int = value.compareTo(other.value)
+
     @JsonValue fun toJson() = value.toString()
 }
 
@@ -110,7 +140,9 @@ value class TimestampWithoutTimezoneValue(val value: LocalDateTime) :
 value class TimeWithTimezoneValue(val value: OffsetTime) :
     AirbyteValue, Comparable<TimeWithTimezoneValue> {
     constructor(time: String) : this(OffsetTime.parse(time))
+
     override fun compareTo(other: TimeWithTimezoneValue): Int = value.compareTo(other.value)
+
     @JsonValue fun toJson() = value.toString()
 }
 
@@ -118,7 +150,9 @@ value class TimeWithTimezoneValue(val value: OffsetTime) :
 value class TimeWithoutTimezoneValue(val value: LocalTime) :
     AirbyteValue, Comparable<TimeWithoutTimezoneValue> {
     constructor(time: String) : this(LocalTime.parse(time))
+
     override fun compareTo(other: TimeWithoutTimezoneValue): Int = value.compareTo(other.value)
+
     @JsonValue fun toJson() = value.toString()
 }
 
@@ -137,6 +171,7 @@ value class ArrayValue(val values: List<AirbyteValue>) : AirbyteValue {
 @JvmInline
 value class ObjectValue(val values: LinkedHashMap<String, AirbyteValue>) : AirbyteValue {
     @JsonValue fun toJson() = values
+
     companion object {
         fun from(map: Map<String, Any?>): ObjectValue =
             ObjectValue(map.mapValuesTo(linkedMapOf()) { (_, v) -> AirbyteValue.from(v) })
@@ -176,6 +211,7 @@ class EnrichedAirbyteValue(
      * Creates a nullified version of this value with the specified reason.
      *
      * @param reason The [Reason] for nullification, defaults to DESTINATION_SERIALIZATION_ERROR
+     * @deprecated Use the new data flow pipeline instead
      */
     fun nullify(reason: Reason = Reason.DESTINATION_SERIALIZATION_ERROR) {
         val nullChange = Meta.Change(field = name, change = Change.NULLED, reason = reason)
@@ -189,10 +225,11 @@ class EnrichedAirbyteValue(
      *
      * @param reason The [Reason] for truncation, defaults to DESTINATION_RECORD_SIZE_LIMITATION
      * @param newValue The new (truncated) value to use
+     * @deprecated Use the new data flow pipeline instead
      */
     fun truncate(
+        newValue: AirbyteValue,
         reason: Reason = Reason.DESTINATION_RECORD_SIZE_LIMITATION,
-        newValue: AirbyteValue
     ) {
         val truncateChange = Meta.Change(field = name, change = Change.TRUNCATED, reason = reason)
 

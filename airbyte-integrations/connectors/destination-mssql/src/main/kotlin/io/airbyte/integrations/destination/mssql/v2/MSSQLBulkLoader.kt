@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.mssql.v2
@@ -31,7 +31,7 @@ class MSSQLBulkLoader(
     private val azureBlobClient: AzureBlobClient,
     private val stream: DestinationStream,
     private val mssqlBulkLoadHandler: MSSQLBulkLoadHandler,
-    private val formatFilePath: String
+    private val formatFilePath: String,
 ) : BulkLoader<AzureBlob> {
     private val log = KotlinLogging.logger {}
 
@@ -54,7 +54,7 @@ class MSSQLBulkLoader(
      * into the destination table using the PK columns.
      */
     private fun handleDedup(dataFilePath: String) {
-        log.info { "Deduplicating $dataFilePath into table for ${stream.descriptor}" }
+        log.info { "Deduplicating $dataFilePath into table for ${stream.mappedDescriptor}" }
         val importType = stream.importType as Dedupe
         val primaryKey =
             if (importType.primaryKey.isNotEmpty()) {
@@ -74,16 +74,16 @@ class MSSQLBulkLoader(
             cursorColumns = importType.cursor,
             nonPkColumns = nonPkColumns,
             dataFilePath = dataFilePath,
-            formatFilePath = formatFilePath
+            formatFilePath = formatFilePath,
         )
     }
 
     /** Performs a simple bulk insert (append-overwrite behavior). */
     private fun handleAppendOverwrite(dataFilePath: String) {
-        log.info { "Loading $dataFilePath into table for ${stream.descriptor}" }
+        log.info { "Loading $dataFilePath into table for ${stream.mappedDescriptor}" }
         mssqlBulkLoadHandler.bulkLoadForAppendOverwrite(
             dataFilePath = dataFilePath,
-            formatFilePath = formatFilePath
+            formatFilePath = formatFilePath,
         )
     }
 
@@ -112,7 +112,7 @@ class MSSQLBulkLoaderFactory(
     private val catalog: DestinationCatalog,
     private val config: MSSQLConfiguration,
     private val bulkLoadConfig: MSSQLBulkLoadConfiguration,
-    private val streamStateStore: StreamStateStore<MSSQLStreamState>
+    private val streamStateStore: StreamStateStore<MSSQLStreamState>,
 ) : BulkLoaderFactory<StreamKey, AzureBlob> {
     override val numPartWorkers: Int = 2
     override val numUploadWorkers: Int = 10
@@ -123,6 +123,7 @@ class MSSQLBulkLoaderFactory(
     override val maxMemoryRatioReservedForParts: Double = 0.6
 
     private val defaultSchema = config.schema
+
     // This cast is guaranteed to succeed by the `Requires` condition
 
     override fun create(key: StreamKey, partition: Int): BulkLoader<AzureBlob> {
@@ -130,10 +131,10 @@ class MSSQLBulkLoaderFactory(
         val mssqlBulkLoadHandler =
             MSSQLBulkLoadHandler(
                 streamStateStore.get(key.stream)!!.dataSource,
-                stream.descriptor.namespace ?: defaultSchema,
-                stream.descriptor.name,
+                stream.mappedDescriptor.namespace ?: defaultSchema,
+                stream.mappedDescriptor.name,
                 bulkLoadConfig.dataSource,
-                MSSQLQueryBuilder(config.schema, stream)
+                MSSQLQueryBuilder(config.schema, stream),
             )
         val state = streamStateStore.get(key.stream)
         check(state != null && state is MSSQLBulkLoaderStreamState) {

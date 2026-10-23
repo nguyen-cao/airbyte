@@ -1,9 +1,10 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.mssql.v2
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings
 import io.airbyte.cdk.load.command.DestinationStream
 import io.airbyte.cdk.load.message.DestinationRecordRaw
 import io.airbyte.cdk.load.write.DirectLoader
@@ -14,13 +15,15 @@ import io.airbyte.integrations.destination.mssql.v2.config.MSSQLIsNotConfiguredF
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.micronaut.context.annotation.Requires
 import jakarta.inject.Singleton
+import java.sql.SQLException
 
+@SuppressFBWarnings("NP_NONNULL_PARAM_VIOLATION", "kotlin coroutines")
 class MSSQLDirectLoader(
     config: MSSQLConfiguration,
     stateStore: StreamStateStore<MSSQLStreamState>,
     private val streamDescriptor: DestinationStream.Descriptor,
     private val batch: Int,
-    private val parent: MSSQLDirectLoaderFactory
+    private val parent: MSSQLDirectLoaderFactory,
 ) : DirectLoader {
     private val log = KotlinLogging.logger {}
     private val recordCommitBatchSize = config.batchEveryNRecords
@@ -37,7 +40,7 @@ class MSSQLDirectLoader(
     private val preparedStatement =
         connection.prepareStatement(state.sqlBuilder.getFinalTableInsertColumnHeader().trimIndent())
 
-    override fun accept(
+    override suspend fun accept(
         record: DestinationRecordRaw,
     ): DirectLoader.DirectLoadResult {
         sqlBuilder.populateStatement(preparedStatement, record, sqlBuilder.finalTableSchema)
@@ -63,14 +66,18 @@ class MSSQLDirectLoader(
         // This is to prevent deadlock errors that will nuke the transaction.
         // TODO: Promote direct loader to use suspend functions so this can use a suspending mutex
         synchronized(parent) {
-            preparedStatement.executeBatch()
+            try {
+                preparedStatement.executeBatch()
+            } catch (e: SQLException) {
+                MSSQLErrorClassifier.rethrowClassified(e)
+            }
             preparedStatement.clearBatch()
             preparedStatement.clearParameters()
             connection.commit()
         }
     }
 
-    override fun finish() {
+    override suspend fun finish() {
         log.info { "Finishing batch $batch for stream $streamDescriptor" }
 
         // Execute remaining records if any
@@ -104,9 +111,10 @@ class MSSQLDirectLoaderFactory(
     override val maxNumOpenLoaders: Int = config.maxNumOpenLoaders
 
     private var batch: Int = 0
+
     override fun create(
         streamDescriptor: DestinationStream.Descriptor,
-        part: Int
+        part: Int,
     ): MSSQLDirectLoader {
         log.info { "Creating query builder for batch $batch of stream $streamDescriptor" }
 

@@ -1,14 +1,17 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.mssql.v2
 
 import com.microsoft.sqlserver.jdbc.SQLServerException
+import io.airbyte.cdk.ConfigErrorException
 import io.airbyte.cdk.load.command.Append
 import io.airbyte.cdk.load.command.Dedupe
 import io.airbyte.cdk.load.command.DestinationStream
 import io.airbyte.cdk.load.command.Overwrite
+import io.airbyte.cdk.load.command.SoftDelete
+import io.airbyte.cdk.load.command.Update
 import io.airbyte.cdk.load.data.AirbyteValue
 import io.airbyte.cdk.load.data.ArrayType
 import io.airbyte.cdk.load.data.ArrayTypeWithoutSchema
@@ -18,8 +21,10 @@ import io.airbyte.cdk.load.data.DateType
 import io.airbyte.cdk.load.data.DateValue
 import io.airbyte.cdk.load.data.FieldType
 import io.airbyte.cdk.load.data.IntegerType
+import io.airbyte.cdk.load.data.IntegerValue
 import io.airbyte.cdk.load.data.NullValue
 import io.airbyte.cdk.load.data.NumberType
+import io.airbyte.cdk.load.data.NumberValue
 import io.airbyte.cdk.load.data.ObjectType
 import io.airbyte.cdk.load.data.ObjectTypeWithEmptySchema
 import io.airbyte.cdk.load.data.ObjectTypeWithoutSchema
@@ -45,6 +50,7 @@ import io.airbyte.cdk.load.message.Meta.Companion.COLUMN_NAME_AB_RAW_ID
 import io.airbyte.cdk.load.util.serializeToString
 import io.airbyte.integrations.destination.mssql.v2.convert.AirbyteTypeToMssqlType
 import io.airbyte.integrations.destination.mssql.v2.convert.AirbyteValueToStatement.Companion.setAsNullValue
+import io.airbyte.integrations.destination.mssql.v2.convert.MSSQLValueCoercer
 import io.airbyte.integrations.destination.mssql.v2.convert.MssqlType
 import io.airbyte.integrations.destination.mssql.v2.convert.ResultSetToAirbyteValue.Companion.getAirbyteNamedValue
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -127,11 +133,13 @@ const val CREATE_TABLE_QUERY =
         END
     """
 
-const val CREATE_INDEX_QUERY = """
+const val CREATE_INDEX_QUERY =
+    """
         CREATE ? INDEX ? ON [?].[?] (?)
     """
 
-const val DROP_TABLE_QUERY = """
+const val DROP_TABLE_QUERY =
+    """
         DROP TABLE [?].[?];
     """
 
@@ -156,12 +164,14 @@ const val MERGE_INTO_QUERY =
         ;
     """
 
-const val ALTER_TABLE_ADD = """
+const val ALTER_TABLE_ADD =
+    """
         ALTER TABLE [?].[?]
         ADD [?] ? NULL;
     """
 
-const val ALTER_TABLE_DROP = """
+const val ALTER_TABLE_DROP =
+    """
         ALTER TABLE [?].[?]
         DROP COLUMN [?];
     """
@@ -185,12 +195,14 @@ const val DELETE_WHERE_COL_LESS_THAN =
         WHERE [?] < ?
     """
 
-const val SELECT_FROM = """
+const val SELECT_FROM =
+    """
         SELECT *
         FROM [?].[?]
     """
 
-const val COUNT_FROM = """
+const val COUNT_FROM =
+    """
         SELECT COUNT(*)
         FROM [?].[?]
     """
@@ -217,11 +229,13 @@ class MSSQLQueryBuilder(
     }
 
     data class NamedField(val name: String, val type: FieldType)
+
     data class NamedValue(val name: String, val value: AirbyteValue)
+
     data class NamedSqlField(val name: String, val type: MssqlType)
 
-    val outputSchema: String = stream.descriptor.namespace ?: defaultSchema
-    val tableName: String = stream.descriptor.name
+    val outputSchema: String = stream.mappedDescriptor.namespace ?: defaultSchema
+    val tableName: String = stream.mappedDescriptor.name
     val uniquenessKey: List<String> =
         when (stream.importType) {
             is Dedupe ->
@@ -232,13 +246,17 @@ class MSSQLQueryBuilder(
                 }
             Append -> emptyList()
             Overwrite -> emptyList()
+            SoftDelete,
+            Update -> throw ConfigErrorException("Unsupported sync mode: ${stream.importType}")
         }
-    private val indexedColumns: Set<String> = uniquenessKey.toSet()
 
-    private val toMssqlType = AirbyteTypeToMssqlType()
+    private val toMssqlType = AirbyteTypeToMssqlType
 
     val finalTableSchema: List<NamedField> = airbyteFinalTableFields + extractFinalTableSchema()
     val hasCdc: Boolean = finalTableSchema.any { it.name == AIRBYTE_CDC_DELETED_AT }
+
+    private val indexedColumns: Set<String> =
+        if (hasCdc) uniquenessKey.toSet() + AIRBYTE_CDC_DELETED_AT else uniquenessKey.toSet()
 
     private fun getExistingSchema(connection: Connection): List<NamedSqlField> {
         val fields = mutableListOf<NamedSqlField>()
@@ -252,8 +270,9 @@ class MSSQLQueryBuilder(
         return fields
     }
 
-    private fun getSchema(): List<NamedSqlField> =
-        finalTableSchema.map { NamedSqlField(it.name, toMssqlType.convert(it.type.type)) }
+    private fun getSchema(): List<NamedSqlField> = finalTableSchema.map {
+        NamedSqlField(it.name, toMssqlType.convert(it.type.type))
+    }
 
     fun updateSchema(connection: Connection) {
         val existingSchema = getExistingSchema(connection)
@@ -268,8 +287,9 @@ class MSSQLQueryBuilder(
 
         val toDelete = existingFields.filter { it.key !in expectedFields }
         val toAdd = expectedFields.filter { it.key !in existingFields }
-        val toAlter =
-            expectedFields.filter { it.key in existingFields && it.value != existingFields[it.key] }
+        val toAlter = expectedFields.filter {
+            it.key in existingFields && it.value != existingFields[it.key]
+        }
 
         val query =
             StringBuilder()
@@ -283,8 +303,8 @@ class MSSQLQueryBuilder(
                                 outputSchema,
                                 tableName,
                                 it.key,
-                                it.value.sqlString
-                            )
+                                it.value.sqlString,
+                            ),
                         )
                     }
                     toAlter.entries.forEach {
@@ -293,8 +313,8 @@ class MSSQLQueryBuilder(
                                 outputSchema,
                                 tableName,
                                 it.key,
-                                it.value.sqlString
-                            )
+                                it.value.sqlString,
+                            ),
                         )
                     }
                 }
@@ -339,7 +359,7 @@ class MSSQLQueryBuilder(
     fun populateStatement(
         statement: PreparedStatement,
         plainRecord: DestinationRecordRaw,
-        schema: List<NamedField>
+        schema: List<NamedField>,
     ) {
         val enrichedRecord = plainRecord.asEnrichedDestinationRecordAirbyteValue()
         val populatedFields = enrichedRecord.allTypedFields
@@ -361,46 +381,53 @@ class MSSQLQueryBuilder(
                 return@forEachIndexed
             }
 
+            // Apply shared MSSQL coercion: range validation + complex-type serialisation
+            MSSQLValueCoercer.coerce(value)
+            if (value.abValue is NullValue) {
+                statement.setAsNullValue(statementIndex, field.type.type)
+                return@forEachIndexed
+            }
+
+            // INSERT-specific: set typed JDBC parameters
             when (value.type) {
                 BooleanType ->
                     statement.setBoolean(statementIndex, (value.abValue as BooleanValue).value)
                 DateType ->
                     statement.setDate(
                         statementIndex,
-                        Date.valueOf((value.abValue as DateValue).value)
+                        Date.valueOf((value.abValue as DateValue).value),
                     )
                 IntegerType ->
-                    LIMITS.validateInteger(value)?.let {
-                        statement.setLong(statementIndex, it.longValueExact())
-                    }
+                    statement.setLong(
+                        statementIndex,
+                        (value.abValue as IntegerValue).value.longValueExact(),
+                    )
                 NumberType ->
-                    LIMITS.validateNumber(value)?.let {
-                        statement.setBigDecimal(statementIndex, it)
-                    }
+                    statement.setBigDecimal(statementIndex, (value.abValue as NumberValue).value)
                 StringType ->
                     statement.setString(statementIndex, (value.abValue as StringValue).value)
                 TimeTypeWithTimezone ->
                     statement.setObject(
                         statementIndex,
-                        (value.abValue as TimeWithTimezoneValue).value
+                        (value.abValue as TimeWithTimezoneValue).value,
                     )
                 TimeTypeWithoutTimezone ->
                     statement.setObject(
                         statementIndex,
-                        (value.abValue as TimeWithoutTimezoneValue).value
+                        (value.abValue as TimeWithoutTimezoneValue).value,
                     )
                 TimestampTypeWithTimezone ->
                     statement.setObject(
                         statementIndex,
-                        (value.abValue as TimestampWithTimezoneValue).value
+                        (value.abValue as TimestampWithTimezoneValue).value,
                     )
                 TimestampTypeWithoutTimezone ->
                     statement.setObject(
                         statementIndex,
-                        (value.abValue as TimestampWithoutTimezoneValue).value
+                        (value.abValue as TimestampWithoutTimezoneValue).value,
                     )
 
-                // Serialize complex types to string
+                // Complex types already serialised to StringValue by MSSQLValueCoercer.coerce()
                 is ArrayType,
                 ArrayTypeWithoutSchema,
                 is ObjectType,
@@ -408,7 +435,7 @@ class MSSQLQueryBuilder(
                 ObjectTypeWithoutSchema,
                 is UnionType,
                 is UnknownType ->
-                    statement.setString(statementIndex, value.abValue.serializeToString())
+                    statement.setString(statementIndex, (value.abValue as StringValue).value)
             }
         }
 
@@ -417,7 +444,7 @@ class MSSQLQueryBuilder(
         airbyteMetaStatementIndex?.let { statementIndex ->
             statement.setString(
                 statementIndex,
-                enrichedRecord.airbyteMeta.abValue.serializeToString()
+                enrichedRecord.airbyteMeta.abValue.serializeToString(),
             )
         }
     }
@@ -446,14 +473,14 @@ class MSSQLQueryBuilder(
                 COLUMNS_KEY to airbyteTypeToSqlSchema(schema),
                 INDEX_KEY to index,
                 SECONDARY_INDEX_KEY to cdcIndex,
-            )
+            ),
         )
     }
 
     private fun createIndex(
         fqTableName: String,
         columns: List<String>,
-        clustered: Boolean = false
+        clustered: Boolean = false,
     ): String {
         val name = "[${fqTableName.replace('.', '_')}_${shortHash(columns.hashCode())}]"
         val indexType = if (clustered) "CLUSTERED" else ""
@@ -462,7 +489,7 @@ class MSSQLQueryBuilder(
             name,
             outputSchema,
             tableName,
-            columns.joinToString(", ") { "[$it]" }
+            columns.joinToString(", ") { "[$it]" },
         )
     }
 
@@ -476,7 +503,7 @@ class MSSQLQueryBuilder(
                     TABLE_KEY to tableName,
                     COLUMNS_KEY to columns,
                     TEMPLATE_COLUMNS_KEY to templateColumns,
-                )
+                ),
             )
         } else {
             val uniquenessConstraint =
@@ -491,7 +518,7 @@ class MSSQLQueryBuilder(
                     COLUMNS_KEY to columns,
                     UNIQUENESS_CONSTRAINT_KEY to uniquenessConstraint,
                     UPDATE_STATEMENT_KEY to updateStatement,
-                )
+                ),
             )
         }
     }
@@ -501,7 +528,7 @@ class MSSQLQueryBuilder(
 
     private fun airbyteTypeToSqlSchema(
         schema: List<NamedField>,
-        separator: String = DEFAULT_SEPARATOR
+        separator: String = DEFAULT_SEPARATOR,
     ): String {
         return schema.joinToString(separator = separator) {
             val mssqlType =

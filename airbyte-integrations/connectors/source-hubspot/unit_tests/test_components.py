@@ -8,7 +8,13 @@ import pytest
 import requests
 from requests import Response
 
+from airbyte_cdk.models import FailureType
+from airbyte_cdk.sources.declarative.decoders import JsonDecoder
+from airbyte_cdk.sources.declarative.interpolation import InterpolatedString
+from airbyte_cdk.sources.declarative.requesters.error_handlers.http_response_filter import HttpResponseFilter
 from airbyte_cdk.sources.declarative.retrievers import SimpleRetriever
+from airbyte_cdk.sources.streams.http.error_handlers.response_models import ResponseAction
+from airbyte_cdk.utils.traced_exception import AirbyteTracedException
 
 
 @pytest.mark.parametrize(
@@ -113,6 +119,39 @@ def test_migrate_empty_string_state(config, state, expected_should_migrate, expe
 
     if actual_should_migrate:
         assert state_migration.migrate(stream_state=state) == expected_state
+
+
+@pytest.mark.parametrize(
+    "raw_fields, treat_as_string, expected_number_schema, expected_boolean_schema",
+    [
+        pytest.param(
+            [{"name": "num_field", "type": "number"}, {"name": "bool_field", "type": "boolean"}],
+            True,
+            {"type": ["null", "string"]},
+            {"type": ["null", "string"]},
+            id="custom_objects_toggle_on",
+        ),
+        pytest.param(
+            [{"name": "num_field", "type": "number"}, {"name": "bool_field", "type": "boolean"}],
+            False,
+            {"type": ["null", "number"]},
+            {"type": ["null", "boolean"]},
+            id="custom_objects_toggle_off",
+        ),
+    ],
+)
+def test_hubspot_custom_objects_schema_loader_respects_toggle(
+    components_module, raw_fields, treat_as_string, expected_number_schema, expected_boolean_schema
+):
+    config = {"treat_numbers_and_booleans_as_strings": treat_as_string}
+    loader = components_module.HubspotCustomObjectsSchemaLoader(
+        config=config,
+        parameters={"schema_properties": raw_fields},
+    )
+    schema = loader.get_json_schema()
+    properties = schema["properties"]["properties"]["properties"]
+    assert properties["num_field"] == expected_number_schema
+    assert properties["bool_field"] == expected_boolean_schema
 
 
 def test_hubspot_rename_properties_transformation(components_module):
@@ -456,6 +495,98 @@ def test_associations_extractor(config, components_module):
         assert records[1]["contacts"] == expected_records[1]["contacts"]
 
 
+def test_associations_extractor_with_permissions_error(requests_mock, oauth_config, components_module):
+    """With OAuth credentials, a 401 on associations should be retried and succeed on the second attempt."""
+    response = requests.Response()
+    response._content = (
+        b'{"results": [{"id": "123", "updatedAt": "2022-02-25T16:43:11Z"}, {"id": "456", "updatedAt": "2022-02-25T16:43:11Z"}]}'
+    )
+    response.status_code = 200
+
+    companies_associations_responses = [
+        {"json": {"error": "The OAuth token used to make this call expired 0 second(s) ago."}, "status_code": 401},
+        {
+            "json": {
+                "results": [
+                    {
+                        "from": {"id": "123"},
+                        "to": [{"associationTypes": [{"category": "HUBSPOT_DEFINED", "label": None, "typeId": 3}], "toObjectId": "408"}],
+                    },
+                    {
+                        "from": {"id": "456"},
+                        "to": [{"associationTypes": [{"category": "HUBSPOT_DEFINED", "label": None, "typeId": 3}], "toObjectId": "888"}],
+                    },
+                ]
+            },
+            "status_code": 200,
+        },
+    ]
+
+    contacts_associations_responses = [{"json": {"results": []}, "status_code": 200}]
+
+    # Mock the OAuth token refresh endpoint so REFRESH_TOKEN_THEN_RETRY can refresh the token
+    requests_mock.register_uri(
+        "POST",
+        "https://api.hubapi.com/oauth/v1/token",
+        [{"json": {"access_token": "refreshed_token", "expires_in": 3600}, "status_code": 200}],
+    )
+    requests_mock.register_uri(
+        "POST", "https://api.hubapi.com/crm/v4/associations/deals/companies/batch/read", companies_associations_responses
+    )
+    requests_mock.register_uri(
+        "POST", "https://api.hubapi.com/crm/v4/associations/deals/contacts/batch/read", contacts_associations_responses
+    )
+
+    extractor = components_module.HubspotAssociationsExtractor(
+        field_path=["results"],
+        entity="deals",
+        associations_list=["companies", "contacts"],
+        decoder=JsonDecoder(parameters={}),
+        config=oauth_config,
+        parameters={},
+    )
+
+    records = list(extractor.extract_records(response=response))
+
+    assert len(records) == 2
+    assert records[0]["id"] == "123"
+    assert records[0]["companies"] == ["408"]
+    assert records[1]["id"] == "456"
+    assert records[1]["companies"] == ["888"]
+
+
+def test_associations_extractor_with_permissions_error_pat(requests_mock, config, components_module):
+    """With PAT credentials, a 401 on associations should fail immediately (no retry)."""
+    response = requests.Response()
+    response._content = (
+        b'{"results": [{"id": "123", "updatedAt": "2022-02-25T16:43:11Z"}, {"id": "456", "updatedAt": "2022-02-25T16:43:11Z"}]}'
+    )
+    response.status_code = 200
+
+    companies_associations_responses = [
+        {"json": {"error": "The OAuth token used to make this call expired 0 second(s) ago."}, "status_code": 401},
+    ]
+
+    requests_mock.register_uri(
+        "POST", "https://api.hubapi.com/crm/v4/associations/deals/companies/batch/read", companies_associations_responses
+    )
+    requests_mock.register_uri(
+        "POST", "https://api.hubapi.com/crm/v4/associations/deals/contacts/batch/read", [{"json": {"results": []}, "status_code": 200}]
+    )
+
+    extractor = components_module.HubspotAssociationsExtractor(
+        field_path=["results"],
+        entity="deals",
+        associations_list=["companies", "contacts"],
+        decoder=JsonDecoder(parameters={}),
+        config=config,
+        parameters={},
+    )
+
+    with pytest.raises(AirbyteTracedException, match="Please, update you Private App access token"):
+        list(extractor.extract_records(response=response))
+
+
 def test_extractor_supports_entity_interpolation(config, components_module):
     parameters = {"entity": "engagements_emails"}
 
@@ -520,6 +651,18 @@ def test_extractor_supports_associations_list_interpolation(config, associations
             "174824652345600.0",
             id="test_unparsable_overflow_error_returns_original_value",
         ),
+        pytest.param(
+            "12345;6789;1525",
+            {"type": ["null", "number"]},
+            "12345;6789;1525",
+            id="test_semicolon_separated_string_returns_original_value_for_number_type",
+        ),
+        pytest.param(
+            "abc123",
+            {"type": ["null", "number"]},
+            "abc123",
+            id="test_non_numeric_string_returns_original_value_for_number_type",
+        ),
     ],
 )
 def test_entity_schema_normalization(components_module, original_value, field_schema, expected_value):
@@ -530,3 +673,172 @@ def test_entity_schema_normalization(components_module, original_value, field_sc
     normalized_value = transform_function(original_value=original_value, field_schema=field_schema)
 
     assert normalized_value == expected_value
+
+
+@pytest.mark.parametrize(
+    "json_response,last_page_size,last_record,last_page_token_value,expected_next_page_token",
+    [
+        pytest.param(
+            {"paging": {"next": {"after": 1200}}}, 200, {"id": 5000}, {"after": 1000}, {"after": 1200}, id="test_next_page_on_first_chunk"
+        ),
+        pytest.param(
+            {"paging": {"next": {"after": 1200}}},
+            100,
+            {"id": 5000},
+            {"after": 1000},
+            None,
+            id="test_stop_paging_when_last_page_is_less_than_page_size",
+        ),
+        pytest.param(
+            {"paging": {"next": {"after": 1200}}}, 0, {"id": 5000}, {"after": 1000}, None, id="test_stop_paging_when_last_page_size_is_zero"
+        ),
+        pytest.param({}, 200, {"id": 5000}, {"after": 1000}, None, id="test_stop_paging_when_no_after_in_response"),
+        pytest.param(
+            {"paging": {"next": {"after": 10000}}},
+            200,
+            {"id": 25000},
+            {"after": 9800},
+            {"after": 0, "id": 25001},
+            id="test_reset_page_and_move_to_next_chunk",
+        ),
+        pytest.param(
+            {"paging": {"next": {"after": 200}}},
+            200,
+            {"id": 30000},
+            {"after": 0, "id": 25001},
+            {"after": 200, "id": 25001},
+            id="test_next_page_on_next_chunk_of_records",
+        ),
+    ],
+)
+def test_crm_search_pagination_strategy(
+    components_module, json_response, last_page_size, last_record, last_page_token_value, expected_next_page_token
+):
+    pagination_strategy = components_module.HubspotCRMSearchPaginationStrategy(page_size=200)
+
+    response = Mock()
+    response.json.return_value = json_response
+
+    actual_next_page_token = pagination_strategy.next_page_token(
+        response=response,
+        last_page_size=last_page_size,
+        last_record=last_record,
+        last_page_token_value=last_page_token_value,
+    )
+
+    assert actual_next_page_token == expected_next_page_token
+
+
+def test_build_associations_retriever_uses_rate_limited_for_429():
+    """Verify that the associations retriever maps HTTP 429 to RATE_LIMITED, not RETRY."""
+    components_module = __import__("components")
+
+    config = {
+        "start_date": "2021-01-10T00:00:00Z",
+        "credentials": {"credentials_title": "Private App Credentials", "access_token": "test_access_token"},
+    }
+
+    parent_entity = InterpolatedString.create("deals", parameters={})
+
+    retriever = components_module.build_associations_retriever(
+        associations_list=["companies", "contacts"],
+        parent_entity=parent_entity,
+        config=config,
+    )
+
+    error_handler = retriever.requester.error_handler
+    # Find the response filter for 429 and verify it uses RATE_LIMITED
+    found_429_filter = False
+    for response_filter in error_handler.response_filters:
+        if 429 in response_filter.http_codes:
+            found_429_filter = True
+            assert (
+                response_filter.action == ResponseAction.RATE_LIMITED
+            ), f"Expected RATE_LIMITED for HTTP 429 in associations retriever, got {response_filter.action}"
+    assert found_429_filter, "No response filter found for HTTP 429 in associations retriever"
+
+
+@pytest.mark.parametrize(
+    "credentials_title, status_code, expected_action, expected_failure_type, expected_error_message",
+    [
+        pytest.param(
+            "Private App Credentials",
+            401,
+            ResponseAction.FAIL,
+            FailureType.config_error,
+            "Please, update you Private App access token. Current token is invalid or expired.",
+            id="pat_401_fails_immediately",
+        ),
+        pytest.param(
+            "OAuth Credentials",
+            401,
+            ResponseAction.REFRESH_TOKEN_THEN_RETRY,
+            None,
+            None,
+            id="oauth_401_refreshes_token_then_retries",
+        ),
+        pytest.param(
+            "Private App Credentials",
+            429,
+            ResponseAction.RATE_LIMITED,
+            None,
+            None,
+            id="pat_429_rate_limited",
+        ),
+        pytest.param(
+            "Private App Credentials",
+            200,
+            ResponseAction.SUCCESS,
+            None,
+            None,
+            id="pat_200_succeeds",
+        ),
+    ],
+)
+def test_hubspot_error_handler_401_by_auth_type(
+    credentials_title, status_code, expected_action, expected_failure_type, expected_error_message
+):
+    """Verify that 401 with PAT credentials fails immediately while 401 with OAuth retries."""
+    components_module = __import__("components")
+
+    config = {
+        "start_date": "2021-01-10T00:00:00Z",
+        "credentials": {"credentials_title": credentials_title, "access_token": "test_access_token"},
+    }
+    parameters = {}
+
+    error_handler = components_module.HubspotErrorHandler(
+        backoff_strategies=[],
+        response_filters=[
+            HttpResponseFilter(
+                action="RATE_LIMITED",
+                http_codes={429},
+                error_message="Rate limited.",
+                config=config,
+                parameters=parameters,
+            ),
+            HttpResponseFilter(
+                action="REFRESH_TOKEN_THEN_RETRY",
+                http_codes={401},
+                error_message="Authentication to HubSpot has expired.",
+                config=config,
+                parameters=parameters,
+            ),
+        ],
+        config=config,
+        parameters=parameters,
+    )
+
+    response = Mock(spec=requests.Response)
+    response.status_code = status_code
+    response.ok = status_code == 200
+    response.headers = {}
+    response.json.return_value = {}
+
+    resolution = error_handler.interpret_response(response)
+
+    assert resolution.response_action == expected_action
+    if expected_failure_type is not None:
+        assert resolution.failure_type == expected_failure_type
+    if expected_error_message is not None:
+        assert resolution.error_message == expected_error_message

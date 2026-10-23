@@ -172,6 +172,22 @@ definitions:
         type: MinMaxDatetime
         datetime: "{{ config['start_date'] }}"
         datetime_format: "%Y-%m-%dT%H:%M:%SZ"
+        # The events endpoint rejects created_at_min older than 7 days
+        # ("created_at_min must be less than 7 days ago"), unlike every other
+        # stream's start_date, which can be arbitrarily old. min_datetime
+        # floors the evaluated date at now - 7 days so a normal historical
+        # start_date does not 422 on this stream specifically. Without this,
+        # the 422 is raised as a config_error, which fails the whole sync --
+        # not just this stream.
+        #
+        # -7 matches the documented contract exactly rather than relying on
+        # undocumented slack: live-tested against the real API, the actual
+        # enforced cutoff is closer to 8 days (7 days 23h still succeeded,
+        # exactly 8 days 422'd), so -7 has close to a full day of real margin
+        # against request/clock timing skew today. That extra day isn't part
+        # of Recharge's documented promise though, so don't rely on it by
+        # pushing this any closer to -8.
+        min_datetime: "{{ day_delta(-7, '%Y-%m-%dT%H:%M:%SZ') }}"
       start_time_option:
         type: RequestOption
         field_name: "created_at_min"
@@ -196,15 +212,14 @@ definitions:
     $parameters:
       name: "metafields"
       data_path: "metafields"
-  # PRODUCTS
-  products_stream:
+  # PLANS
+  plans_stream:
     description: >-
-      Products Stream: https://developer.rechargepayments.com/2021-11/products/products_list
-      Products endpoint has 422 error with 2021-11 API version
-    $ref: "#/definitions/base_deprecated_api_stream"
+      Plans Stream: https://developer.rechargepayments.com/2021-11/plans/plans_list
+    $ref: "#/definitions/base_modern_api_stream"
     $parameters:
-      name: "products"
-      data_path: "products"
+      name: "plans"
+      data_path: "plans"
   # SHOP
   shop_stream:
     description: >-
@@ -318,7 +333,7 @@ streams:
   - "#/definitions/discounts_stream"
   - "#/definitions/metafields_stream"
   - "#/definitions/onetimes_stream"
-  - "#/definitions/products_stream"
+  - "#/definitions/plans_stream"
   - "#/definitions/shop_stream"
   - "#/definitions/subscriptions_stream"
   - "#/definitions/events_stream"

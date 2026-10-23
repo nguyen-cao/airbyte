@@ -1,4 +1,4 @@
-/* Copyright (c) 2024 Airbyte, Inc., all rights reserved. */
+/* Copyright (c) 2026 Airbyte, Inc., all rights reserved. */
 package io.airbyte.cdk.read
 
 import com.fasterxml.jackson.databind.JsonNode
@@ -11,6 +11,9 @@ import io.airbyte.cdk.command.OpaqueStateValue
 import io.airbyte.cdk.discover.MetaField
 import io.airbyte.cdk.discover.MetaFieldDecorator
 import io.airbyte.cdk.output.BufferingOutputConsumer
+import io.airbyte.cdk.output.DataChannelFormat
+import io.airbyte.cdk.output.DataChannelMedium
+import io.airbyte.cdk.output.sockets.NativeRecordPayload
 import io.airbyte.cdk.util.Jsons
 import io.airbyte.protocol.models.v0.AirbyteMessage
 import io.airbyte.protocol.models.v0.AirbyteStateMessage
@@ -35,6 +38,11 @@ import org.junit.jupiter.api.TestFactory
 import org.junit.jupiter.api.Timeout
 
 const val TEST_TIMEOUT_SECONDS = 10L
+
+val dcm = DataChannelMedium.STDIO
+val dcf = DataChannelFormat.JSONL
+val bufferSize = 8192
+val clock = ClockFactory().fixed()
 
 @Timeout(TEST_TIMEOUT_SECONDS)
 class RootReaderIntegrationTest {
@@ -90,8 +98,9 @@ class RootReaderIntegrationTest {
 
     /** Simulates a READ operation for each test case, which corresponds to a one-stream catalog. */
     @TestFactory
-    fun testConcurrent(): Iterable<DynamicNode> =
-        testCases.map { DynamicTest.dynamicTest(it.name, it::run) }
+    fun testConcurrent(): Iterable<DynamicNode> = testCases.map {
+        DynamicTest.dynamicTest(it.name, it::run)
+    }
 
     /** Similar to [testConcurrent] but with a resource which forces serial execution. */
     @TestFactory
@@ -123,9 +132,14 @@ class RootReaderIntegrationTest {
                 excessiveTimeout,
                 testOutputConsumer,
                 NoOpMetaFieldDecorator,
+                ResourceAcquirer(emptyList()),
                 listOf(
-                    TestPartitionsCreatorFactory(Semaphore(CONSTRAINED), *testCases.toTypedArray())
+                    TestPartitionsCreatorFactory(Semaphore(CONSTRAINED), *testCases.toTypedArray()),
                 ),
+                dcf,
+                dcm,
+                bufferSize,
+                clock,
             )
         Assertions.assertThrows(RuntimeException::class.java) {
             runBlocking(Dispatchers.Default) { rootReader.read() }
@@ -169,9 +183,14 @@ class RootReaderIntegrationTest {
                 excessiveTimeout,
                 testOutputConsumer,
                 NoOpMetaFieldDecorator,
+                ResourceAcquirer(emptyList()),
                 listOf(
-                    TestPartitionsCreatorFactory(Semaphore(CONSTRAINED), *testCases.toTypedArray())
+                    TestPartitionsCreatorFactory(Semaphore(CONSTRAINED), *testCases.toTypedArray()),
                 ),
+                dcf,
+                dcm,
+                bufferSize,
+                clock,
             )
         Assertions.assertThrows(RuntimeException::class.java) {
             runBlocking(Dispatchers.Default) { rootReader.read() }
@@ -217,12 +236,17 @@ class RootReaderIntegrationTest {
                 excessiveTimeout,
                 testOutputConsumer,
                 NoOpMetaFieldDecorator,
+                ResourceAcquirer(emptyList()),
                 listOf(
                     ConfigErrorThrowingGlobalPartitionsCreatorFactory(
                         Semaphore(CONSTRAINED),
-                        *testCases.toTypedArray()
-                    )
+                        *testCases.toTypedArray(),
+                    ),
                 ),
+                dcf,
+                dcm,
+                bufferSize,
+                clock,
             )
         Assertions.assertThrows(ConfigErrorException::class.java) {
             runBlocking(Dispatchers.Default) { rootReader.read() }
@@ -281,7 +305,12 @@ data class TestCase(
                 excessiveTimeout,
                 testOutputConsumer,
                 NoOpMetaFieldDecorator,
+                ResourceAcquirer(emptyList()),
                 listOf(TestPartitionsCreatorFactory(Semaphore(resource), this)),
+                dcf,
+                dcm,
+                bufferSize,
+                clock,
             )
         try {
             runBlocking(Dispatchers.Default) { rootReader.read() }
@@ -338,12 +367,12 @@ data class TestCase(
                             Assertions.assertFalse(
                                 hasCompleted,
                                 "Case $name cannot emit a STARTED trace " +
-                                    "message because it already emitted a COMPLETE."
+                                    "message because it already emitted a COMPLETE.",
                             )
                             Assertions.assertFalse(
                                 hasIncompleted,
                                 "Case $name cannot emit a STARTED trace " +
-                                    "message because it already emitted an INCOMPLETE."
+                                    "message because it already emitted an INCOMPLETE.",
                             )
                         }
                         AirbyteStreamStatusTraceMessage.AirbyteStreamStatus.COMPLETE -> {
@@ -351,7 +380,7 @@ data class TestCase(
                             Assertions.assertTrue(
                                 hasStarted,
                                 "Case $name cannot emit a COMPLETE trace " +
-                                    "message because it hasn't emitted a STARTED yet."
+                                    "message because it hasn't emitted a STARTED yet.",
                             )
                         }
                         AirbyteStreamStatusTraceMessage.AirbyteStreamStatus.INCOMPLETE -> {
@@ -359,7 +388,7 @@ data class TestCase(
                             Assertions.assertTrue(
                                 hasStarted,
                                 "Case $name cannot emit an INCOMPLETE trace " +
-                                    "message because it hasn't emitted a STARTED yet."
+                                    "message because it hasn't emitted a STARTED yet.",
                             )
                         }
                         else ->
@@ -377,27 +406,27 @@ data class TestCase(
         }
         Assertions.assertTrue(
             hasStarted,
-            "Case $name should have emitted a STARTED trace message, but hasn't."
+            "Case $name should have emitted a STARTED trace message, but hasn't.",
         )
         if (isSuccessful) {
             if (!hasCompleted) {
                 Assertions.assertTrue(
                     hasCompleted,
-                    "Case $name should have emitted a COMPLETE trace message, but hasn't."
+                    "Case $name should have emitted a COMPLETE trace message, but hasn't.",
                 )
             }
             Assertions.assertFalse(
                 hasIncompleted,
-                "Case $name should not have emitted an INCOMPLETE trace message, but did anyway."
+                "Case $name should not have emitted an INCOMPLETE trace message, but did anyway.",
             )
         } else {
             Assertions.assertFalse(
                 hasCompleted,
-                "Case $name should not have emitted a COMPLETE trace message, but did anyway."
+                "Case $name should not have emitted a COMPLETE trace message, but did anyway.",
             )
             Assertions.assertTrue(
                 hasIncompleted,
-                "Case $name should have emitted an INCOMPLETE trace message, but hasn't."
+                "Case $name should have emitted an INCOMPLETE trace message, but hasn't.",
             )
         }
     }
@@ -434,7 +463,7 @@ data class TestCase(
             }
             Assertions.assertNotNull(
                 actual,
-                "Case $name didn't emit any state checkpoint in round $partitionsCreatorID, but should have emitted: $expected"
+                "Case $name didn't emit any state checkpoint in round $partitionsCreatorID, but should have emitted: $expected",
             )
             for (actualState in actual!!) {
                 Assertions.assertTrue(
@@ -699,7 +728,14 @@ data object NoOpMetaFieldDecorator : MetaFieldDecorator {
         timestamp: OffsetDateTime,
         globalStateValue: OpaqueStateValue?,
         stream: Stream,
-        recordData: ObjectNode
+        recordData: ObjectNode,
+    ) {}
+
+    override fun decorateRecordData(
+        timestamp: OffsetDateTime,
+        globalStateValue: OpaqueStateValue?,
+        stream: Stream,
+        recordData: NativeRecordPayload,
     ) {}
 }
 

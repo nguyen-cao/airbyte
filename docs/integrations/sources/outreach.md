@@ -28,6 +28,7 @@ Some output streams are available from this source. A list of these streams can 
 
 Getting oauth credentials require contacting Outreach to request an account. Check out [here](https://www.outreach.io/lp/watch-demo#request-demo).
 Once you have an API application, you can follow the steps [here](https://api.outreach.io/api/v2/docs#authentication) to obtain a refresh token.
+Don't set the Access Token and Token Expiry Date fields, and don't send them as empty strings. The connector fills them in and saves each new refresh token that Outreach returns.
 
 ## Streams
 
@@ -49,6 +50,18 @@ List of available streams:
 - Templates
 - Snippets
 
+:::warning Upcoming change to the Prospects stream
+Starting **October 1, 2026**, Outreach will no longer include the `contactHistogram` attribute in the default response of the `/prospects` endpoint. See the [Outreach deprecated features page](https://developers.outreach.io/api/deprecated-features/) for details.
+
+After that date, the `contactHistogram` column in the `Prospects` stream will be `null` for newly synced records. Syncs will continue to run normally, and no other fields, the primary key (`id`), or the cursor (`updatedAt`) are affected. Historical values already in your destination are unchanged.
+
+If you rely on `contactHistogram`, retrieve it directly from the Outreach API by requesting it explicitly with the `fields[prospect]` parameter.
+:::
+
+## IP allow list
+
+If you use Airbyte Cloud and your organization restricts access to specific IPs, add the [Airbyte Cloud IP addresses](https://docs.airbyte.com/platform/operating-airbyte/ip-allowlist) to your allow list.
+
 ## Changelog
 
 <details>
@@ -56,6 +69,42 @@ List of available streams:
 
 | Version | Date       | Pull Request | Subject |
 | :------ |:-----------| :----- | :------ |
+| 1.1.50 | 2026-10-20 | [89080](https://github.com/airbytehq/airbyte/pull/89080) | Save rotated OAuth tokens and refresh the access token on 401 |
+| 1.1.49 | 2026-10-20 | [89347](https://github.com/airbytehq/airbyte/pull/89347) | Update dependencies |
+| 1.1.48 | 2026-10-13 | [88737](https://github.com/airbytehq/airbyte/pull/88737) | Update dependencies |
+| 1.1.47 | 2026-10-06 | [87971](https://github.com/airbytehq/airbyte/pull/87971) | Update dependencies |
+| 1.1.46 | 2026-09-29 | [87292](https://github.com/airbytehq/airbyte/pull/87292) | Update dependencies |
+| 1.1.45 | 2026-09-22 | [86761](https://github.com/airbytehq/airbyte/pull/86761) | Update dependencies |
+| 1.1.44 | 2026-09-15 | [86167](https://github.com/airbytehq/airbyte/pull/86167) | Update dependencies |
+| 1.1.43 | 2026-09-08 | [85592](https://github.com/airbytehq/airbyte/pull/85592) | Update dependencies |
+| 1.1.42 | 2026-08-18 | [84700](https://github.com/airbytehq/airbyte/pull/84700) | Update dependencies |
+| 1.1.41 | 2026-08-11 | [84057](https://github.com/airbytehq/airbyte/pull/84057) | Update dependencies |
+| 1.1.40 | 2026-07-28 | [83194](https://github.com/airbytehq/airbyte/pull/83194) | Update to CDK 7.23.8 (fixes AirbyteCustomCodeNotPermittedError for bundled custom components) and remove the temporary Cloud version override |
+| 1.1.39 | 2026-07-28 | [1082](https://github.com/airbytehq/airbyte-python-cdk/issues/1082) | Roll Cloud back to 1.1.37 — 1.1.38 is built on SDM 7.23.7, which breaks bundled custom components |
+| 1.1.38 | 2026-07-28 | [83024](https://github.com/airbytehq/airbyte/pull/83024) | Update dependencies |
+| 1.1.37 | 2026-07-21 | [82528](https://github.com/airbytehq/airbyte/pull/82528) | Update dependencies |
+| 1.1.36 | 2026-07-14 | [81970](https://github.com/airbytehq/airbyte/pull/81970) | Update dependencies |
+| 1.1.35 | 2026-06-30 | [81199](https://github.com/airbytehq/airbyte/pull/81199) | Update dependencies |
+| 1.1.34 | 2026-06-23 | [80582](https://github.com/airbytehq/airbyte/pull/80582) | Update dependencies |
+| 1.1.33 | 2026-06-16 | [79977](https://github.com/airbytehq/airbyte/pull/79977) | Update dependencies |
+| 1.1.32 | 2026-06-09 | [79467](https://github.com/airbytehq/airbyte/pull/79467) | Update dependencies |
+| 1.1.31 | 2026-06-02 | [78890](https://github.com/airbytehq/airbyte/pull/78890) | Update dependencies |
+| 1.1.30 | 2026-04-28 | [77375](https://github.com/airbytehq/airbyte/pull/77375) | Update dependencies |
+| 1.1.29 | 2026-04-21 | [75661](https://github.com/airbytehq/airbyte/pull/75661) | Update dependencies |
+| 1.1.28 | 2026-03-24 | [74990](https://github.com/airbytehq/airbyte/pull/74990) | Update dependencies |
+| 1.1.27 | 2026-03-10 | [74654](https://github.com/airbytehq/airbyte/pull/74654) | Update dependencies |
+| 1.1.26 | 2026-03-03 | [74222](https://github.com/airbytehq/airbyte/pull/74222) | Update dependencies |
+| 1.1.25 | 2026-02-17 | [73573](https://github.com/airbytehq/airbyte/pull/73573) | Update dependencies |
+| 1.1.24 | 2026-02-10 | [73077](https://github.com/airbytehq/airbyte/pull/73077) | Update dependencies |
+| 1.1.23 | 2026-01-20 | [72184](https://github.com/airbytehq/airbyte/pull/72184) | Update dependencies |
+| 1.1.22 | 2026-01-14 | [71668](https://github.com/airbytehq/airbyte/pull/71668) | Update dependencies |
+| 1.1.21 | 2025-12-18 | [70477](https://github.com/airbytehq/airbyte/pull/70477) | Update dependencies |
+| 1.1.20 | 2025-11-25 | [70117](https://github.com/airbytehq/airbyte/pull/70117) | Update dependencies |
+| 1.1.19 | 2025-11-18 | [69711](https://github.com/airbytehq/airbyte/pull/69711) | Update dependencies |
+| 1.1.18 | 2025-10-29 | [69003](https://github.com/airbytehq/airbyte/pull/69003) | Update dependencies |
+| 1.1.17 | 2025-10-21 | [68289](https://github.com/airbytehq/airbyte/pull/68289) | Update dependencies |
+| 1.1.16 | 2025-10-14 | [67764](https://github.com/airbytehq/airbyte/pull/67764) | Update dependencies |
+| 1.1.15 | 2025-10-07 | [61052](https://github.com/airbytehq/airbyte/pull/61052) | Update dependencies |
 | 1.1.14 | 2025-05-24 | [60532](https://github.com/airbytehq/airbyte/pull/60532) | Update dependencies |
 | 1.1.13 | 2025-05-10 | [60057](https://github.com/airbytehq/airbyte/pull/60057) | Update dependencies |
 | 1.1.12 | 2025-05-04 | [59050](https://github.com/airbytehq/airbyte/pull/59050) | Update dependencies |
@@ -67,7 +116,7 @@ List of available streams:
 | 1.1.6 | 2025-03-09 | [55180](https://github.com/airbytehq/airbyte/pull/55180) | 🐛 Source Outreach: remove stream_state interpolation |
 | 1.1.5 | 2025-03-08 | [55561](https://github.com/airbytehq/airbyte/pull/55561) | Update dependencies |
 | 1.1.4 | 2025-03-01 | [54611](https://github.com/airbytehq/airbyte/pull/54611) | Update dependencies |
-| 1.1.3 | 2025-02-24 | [53976](https://github.com/airbytehq/airbyte/pull/54654) | Lower mailings endpoint page size to 100 from 1000 |
+| 1.1.3 | 2025-02-24 | [54654](https://github.com/airbytehq/airbyte/pull/54654) | Lower mailings endpoint page size to 100 from 1000 |
 | 1.1.2 | 2025-02-15 | [53976](https://github.com/airbytehq/airbyte/pull/53976) | Update dependencies |
 | 1.1.1 | 2025-02-08 | [53480](https://github.com/airbytehq/airbyte/pull/53480) | Update dependencies |
 | 1.1.0 | 2025-02-05 | [47294](https://github.com/airbytehq/airbyte/pull/47294) | Migrate to manifest only format |

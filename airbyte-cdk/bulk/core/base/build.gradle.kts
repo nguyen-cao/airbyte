@@ -1,10 +1,5 @@
-import de.undercouch.gradle.tasks.download.Download
-import io.netifi.flatbuffers.plugin.tasks.FlatBuffers
-
 plugins {
-    id("de.undercouch.download") version ("5.6.0")
     id("com.google.protobuf") version("0.9.4")
-    id("io.netifi.flatbuffers") version("1.0.7")
 }
 
 kotlin {
@@ -61,23 +56,21 @@ tasks.withType<Copy>().configureEach {
     duplicatesStrategy = DuplicatesStrategy.INCLUDE
 }
 
-val flatBuffersArchive = "fbs/fbs.zip"
-val flatBuffersArchiveDownloadBaseUrl = "https://github.com/google/flatbuffers/releases/latest/download"
-// Select the proper FlatBuffers binary based on the build operating system
-val osName = System.getProperty("os.name").lowercase()
-val flatBuffersDownloadUrl = when(osName) {
-    "mac os x" -> "$flatBuffersArchiveDownloadBaseUrl/Mac.flatc.binary.zip"
-    "windows" -> "$flatBuffersArchiveDownloadBaseUrl/Windows.flatc.binary.zip"
-    else -> "$flatBuffersArchiveDownloadBaseUrl/Linux.flatc.binary.g++-13.zip"
-}
-
 dependencies {
 
     api("com.fasterxml.jackson.core:jackson-annotations")
     api("com.fasterxml.jackson.core:jackson-databind")
     api("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
     api("com.kjetland:mbknor-jackson-jsonschema_2.13:1.0.39")
-    api("io.airbyte.airbyte-protocol:protocol-models:0.17.0") {
+    constraints {
+        api("org.scala-lang:scala-library:2.13.9") {
+            because("override transitive dep from mbknor-jackson-jsonschema — CVE-2022-36944 (deserialization gadget chain)")
+        }
+        api("io.github.classgraph:classgraph:4.8.112") {
+            because("override transitive dep from mbknor-jackson-jsonschema — CVE-2021-47621 (XXE)")
+        }
+    }
+    api("io.airbyte.airbyte-protocol:protocol-models:0.19.0") {
         exclude(group="com.google.guava", module="guava")
         exclude(group="com.google.api-client")
         exclude(group="org.apache.logging.log4j")
@@ -97,7 +90,7 @@ dependencies {
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
     implementation("com.fasterxml.jackson.module:jackson-module-afterburner")
     implementation("info.picocli:picocli:4.7.6")
-    implementation("io.micronaut.picocli:micronaut-picocli:5.5.0")
+    implementation("io.micronaut.picocli:micronaut-picocli:5.9.0")
     implementation("jakarta.validation:jakarta.validation-api:3.1.0")
     implementation("org.apache.commons:commons-lang3:3.17.0")
     implementation("org.apache.logging.log4j:log4j-api")
@@ -123,46 +116,11 @@ dependencies {
     testFixturesApi("org.testcontainers:testcontainers") {
         exclude(group="org.apache.commons", module="commons-compress")
     }
-    testFixturesApi("io.micronaut.test:micronaut-test-core:4.5.0")
-    testFixturesApi("io.micronaut.test:micronaut-test-junit5:4.5.0")
+    testFixturesApi("io.micronaut.test:micronaut-test-core:4.10.3")
+    testFixturesApi("io.micronaut.test:micronaut-test-junit5:4.10.3")
     testFixturesApi("io.github.deblockt:json-diff:1.1.0")
-}
-
-flatbuffers {
-    flatBuffersVersion = "25.2.10"
-    flatcPath = "${project.layout.buildDirectory.get()}/fbs/flatc"
-    language = "java"
 }
 
 tasks.test {
     environment=mapOf("PRESENT" to "present-value")
-}
-
-tasks.register<Download>("downloadFlatc") {
-    src(flatBuffersDownloadUrl)
-    dest(project.layout.buildDirectory.file(flatBuffersArchive))
-    overwrite(true)
-
-}
-
-tasks.register<Copy>("installFlatc") {
-    dependsOn("downloadFlatc")
-    val file = project.layout.buildDirectory.file(flatBuffersArchive)
-    val outputDir = project.layout.buildDirectory.dir("fbs")
-    from(zipTree(file))
-    into(outputDir)
-}
-
-
-tasks.register<FlatBuffers>("generateFbs") {
-    inputDir = file("src/main/fbs")
-    outputDir = file("build/generated/fbs")
-    language = "java"
-    dependsOn("installFlatc")
-}
-
-tasks.configureEach {
-    when(name) {
-        "compileJava", "compileTestJava", "compileKotlin", "compileTestKotlin", "kspKotlin" -> dependsOn("generateFbs")
-    }
 }

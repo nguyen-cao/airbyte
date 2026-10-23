@@ -6,7 +6,7 @@ products: all
 
 Airbyte is committed to keeping your data safe by following industry-standard practices for securing physical deployments, setting access policies, and leveraging the security features of leading Cloud providers.
 
-If you have any security concerns with Airbyte or believe you have uncovered a vulnerability, contact us at [security@airbyte.io](mailto:security@airbyte.io)
+If you believe you've found a security vulnerability in Airbyte, report it by following the instructions on [Report a security vulnerability](https://airbyte.com/security/vdp). For more information about Airbyte's security practices and compliance certifications, visit the [Airbyte Trust Center](https://trust.airbyte.com/).
 
 ## Securing your data
 
@@ -26,7 +26,7 @@ Airbyte retains configuration details and data points such as table and column n
 
 As Airbyte is not aware of the data being transferred, users are required to follow the [Terms of Services](https://airbyte.com/terms) and are ultimately responsible for ensuring their data transfer is compliant with their jurisdiction.
 
-For more information, see [Airbyte’s Privacy Policy](https://airbyte.com/privacy-policy)
+For more information, see [Airbyte’s Privacy Policy](https://airbyte.com/privacy-policy).
 
 ## Securing Airbyte Open Source
 
@@ -95,7 +95,7 @@ Airbyte Cloud leverages the security features of leading Cloud providers and set
 
 ### Physical infrastructure
 
-Airbyte Cloud is currently deployed on GCP with all servers located in the United States. We use isolated pods to ensure your data is kept separate from other customers’ data.
+Airbyte Cloud uses control planes on GCP in the United States. Airbyte uses isolated pods to keep your data separate from other customers’ data. Data planes [are available](../cloud/managing-airbyte-cloud/manage-data-residency) in the United States (GCP) and European Union (AWS). If you [deploy your own data plane](../enterprise-flex/), that data plane runs in your own infrastructure.
 
 Only certain Airbyte staff can access Airbyte infrastructure and technical logs for deployments, upgrades, configuration changes, and troubleshooting.
 
@@ -123,6 +123,10 @@ Airbyte Cloud supports [user management](/platform/using-airbyte/core-concepts/)
 
 In addition, Airbyte Cloud and  Airbyte Enterprise support [role-based access control](/platform/access-management/rbac) allowing admins to manage varying access levels across users in their instance.
 
+### Audit logging
+
+Pro and Enterprise Flex organizations have [audit logs](/platform/access-management/audit-logs) that record who changed workspaces, connections, connectors, users, permissions, and settings. Airbyte stores these logs in the control plane and retains them for 365 days.
+
 ### Compliance
 
 Our compliance efforts for Airbyte Cloud include:
@@ -137,8 +141,8 @@ Our compliance efforts for Airbyte Cloud include:
 Do not file GitHub issues or post on our community Slack or forum for security vulnerabilities since they're public avenues and may lead to additional security concerns.
 :::
 
-Airbyte takes security issues very seriously. If you have any concerns about Airbyte or believe you have uncovered a vulnerability, contact us at [security@airbyte.io](mailto:security@airbyte.io). In the message, try to describe the issue and a way to reproduce it. The security team will get back to you as soon as possible.
+Airbyte takes security issues very seriously. To report a vulnerability, go to [Report a security vulnerability](https://airbyte.com/security/vdp). Airbyte Cloud and Airbyte open source each have their own vulnerability disclosure policy. Read the policy for the affected product before you test or submit a report. Each policy explains what's in scope, how to test safely, and how to submit your report.
 
-Use this security address only for undisclosed vulnerabilities. For fixed issues or general questions on how to use the security features, use the [Discourse forum](https://discuss.airbyte.io/) or [Community Slack](https://slack.airbyte.com/).
+Use the vulnerability disclosure process only for undisclosed vulnerabilities. For fixed issues or general questions on how to use the security features, use the [Community Slack](https://slack.airbyte.com/) or [GitHub discussions](https://github.com/airbytehq/airbyte/discussions).
 
 Please report any security problems to us before disclosing it publicly.

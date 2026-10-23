@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.data.json
@@ -32,6 +32,11 @@ class AirbyteTypeToJsonSchema {
                 airbyteType.properties.forEach { (name, field) ->
                     properties.replace(name, convert(field.type))
                 }
+                if (!airbyteType.required.isEmpty()) {
+                    val required = objNode.putArray("required")
+                    airbyteType.required.forEach { required.add(it) }
+                }
+                objNode.put("additionalProperties", airbyteType.additionalProperties)
                 objNode
             }
             is ObjectTypeWithoutSchema -> ofType("object")

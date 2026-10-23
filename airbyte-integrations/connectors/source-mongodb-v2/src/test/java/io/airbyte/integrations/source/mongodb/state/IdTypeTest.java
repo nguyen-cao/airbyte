@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.source.mongodb.state;
@@ -34,7 +34,7 @@ class IdTypeTest {
 
   @Test
   void supported() {
-    assertEquals("objectId, string, int, long, binData", IdType.SUPPORTED);
+    assertEquals("objectId, string, int, long, binData, object", IdType.SUPPORTED);
   }
 
   @Test

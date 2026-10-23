@@ -6,5 +6,5 @@ acceptance_tests:
         config_path: "integration_tests/config.json"
   connection:
     tests:
-      - config_path: "integration_tests/config.json"
+      - config_path: "secrets/config.json"
         status: "succeed"

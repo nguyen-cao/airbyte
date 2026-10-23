@@ -16,6 +16,7 @@ from airbyte_cdk import (
     RecordSelector,
     SimpleRetriever,
 )
+from airbyte_cdk.models import FailureType
 from airbyte_cdk.sources.declarative.auth.oauth import DeclarativeOauth2Authenticator
 from airbyte_cdk.sources.declarative.auth.selective_authenticator import SelectiveAuthenticator
 from airbyte_cdk.sources.declarative.auth.token_provider import InterpolatedStringTokenProvider
@@ -27,17 +28,49 @@ from airbyte_cdk.sources.declarative.interpolation import InterpolatedString
 from airbyte_cdk.sources.declarative.migrations.state_migration import StateMigration
 from airbyte_cdk.sources.declarative.partition_routers.list_partition_router import ListPartitionRouter
 from airbyte_cdk.sources.declarative.requesters import HttpRequester
+from airbyte_cdk.sources.declarative.requesters.error_handlers.backoff_strategies import (
+    ExponentialBackoffStrategy,
+    WaitTimeFromHeaderBackoffStrategy,
+)
+from airbyte_cdk.sources.declarative.requesters.error_handlers.default_error_handler import DefaultErrorHandler
+from airbyte_cdk.sources.declarative.requesters.error_handlers.http_response_filter import HttpResponseFilter
 from airbyte_cdk.sources.declarative.requesters.paginators.strategies.pagination_strategy import PaginationStrategy
 from airbyte_cdk.sources.declarative.requesters.request_options import InterpolatedRequestOptionsProvider
 from airbyte_cdk.sources.declarative.requesters.requester import Requester
 from airbyte_cdk.sources.declarative.schema.schema_loader import SchemaLoader
 from airbyte_cdk.sources.declarative.transformations import RecordTransformation
+from airbyte_cdk.sources.streams.http.error_handlers.response_models import ErrorResolution, ResponseAction
 from airbyte_cdk.sources.types import Config, Record, StreamSlice, StreamState
 from airbyte_cdk.sources.utils.transform import TransformConfig, TypeTransformer
 from airbyte_cdk.utils.datetime_helpers import AirbyteDateTime, ab_datetime_format, ab_datetime_now, ab_datetime_parse
 
 
 logger = logging.getLogger("airbyte")
+
+_PRIVATE_APP_CREDENTIALS = "Private App Credentials"
+
+
+class HubspotErrorHandler(DefaultErrorHandler):
+    """
+    Custom error handler that differentiates 401 handling based on authentication type.
+
+    For OAuth: 401 is retried because the OAuthAuthenticator can transparently refresh expired tokens.
+    For Private App Token (PAT): 401 is a permanent failure because static tokens cannot be refreshed.
+    """
+
+    def interpret_response(self, response_or_exception: Optional[Union[requests.Response, Exception]]) -> ErrorResolution:
+        if (
+            isinstance(response_or_exception, requests.Response)
+            and response_or_exception.status_code == 401
+            and self.config.get("credentials", {}).get("credentials_title") == _PRIVATE_APP_CREDENTIALS
+        ):
+            return ErrorResolution(
+                response_action=ResponseAction.FAIL,
+                failure_type=FailureType.config_error,
+                error_message="Please, update you Private App access token. Current token is invalid or expired.",
+            )
+
+        return super().interpret_response(response_or_exception)
 
 
 @dataclass
@@ -196,6 +229,93 @@ class AddFieldsFromEndpointTransformation(RecordTransformation):
 
         for data in additional_data:
             record.update(data)
+
+
+@dataclass
+class MarketingEmailStatisticsTransformation(RecordTransformation):
+    """
+    Custom transformation for HubSpot Marketing Emails that fetches statistics from the v3 API.
+
+    This transformation is needed because the v3 API separates email data and statistics into two endpoints:
+    - GET /marketing/v3/emails - for email data
+    - GET /marketing/v3/emails/{emailId}/statistics - for statistics
+
+    This transformation fetches statistics for each email and merges them into the email record.
+    """
+
+    requester: Requester
+    record_selector: HttpSelector
+
+    def transform(
+        self,
+        record: Dict[str, Any],
+        config: Optional[Config] = None,
+        stream_state: Optional[StreamState] = None,
+        stream_slice: Optional[StreamSlice] = None,
+    ) -> None:
+        try:
+            # Fetch statistics for this email using the v3 statistics endpoint
+            statistics_response = self.requester.send_request(
+                stream_slice=StreamSlice(partition={"email_id": record["id"]}, cursor_slice={})
+            )
+            statistics_data = self.record_selector.select_records(response=statistics_response, stream_state={}, records_schema={})
+
+            # Merge statistics into the email record
+            for stats in statistics_data:
+                record.update(stats)
+
+        except Exception as e:
+            # Log the error but don't fail the entire sync
+            # This ensures that if statistics are unavailable for some emails,
+            # we still get the email data
+            logger.warning(f"Failed to fetch statistics for email {record.get('id', 'unknown')}: {str(e)}")
+            pass
+
+
+@dataclass
+class HubspotFlowDetailsTransformation(RecordTransformation):
+    """
+    Custom transformation for the `flows` stream that fetches a full workflow definition.
+
+    HubSpot's Flows v4 list endpoint (GET /automation/v4/flows) only returns a summary of each
+    flow (`id`, `name`, `flowType`, `isEnabled`, `objectTypeId`, `revisionId`, `createdAt`,
+    `updatedAt`, `uuid`). The action graph, enrollment criteria, data sources and scheduling
+    settings are only available from GET /automation/v4/flows/{flowId}, so this transformation
+    makes one detail request per flow and merges the response into the listing record.
+
+    Unlike `AddFieldsFromEndpointTransformation`, a failed detail request does not abort the sync.
+    HubSpot requires additional `*.sensitive.read` scopes for flows that touch sensitive data, so a
+    single inaccessible flow in an otherwise readable portal would otherwise fail the whole stream.
+    When the detail request fails, the summary record from the listing endpoint is emitted as-is and
+    a warning naming the flow is logged.
+    """
+
+    requester: Requester
+    record_selector: HttpSelector
+
+    def transform(
+        self,
+        record: Dict[str, Any],
+        config: Optional[Config] = None,
+        stream_state: Optional[StreamState] = None,
+        stream_slice: Optional[StreamSlice] = None,
+    ) -> None:
+        flow_id = record.get("id")
+        try:
+            details_response = self.requester.send_request(stream_slice=StreamSlice(partition={"parent_id": flow_id}, cursor_slice={}))
+            details = self.record_selector.select_records(response=details_response, stream_state={}, records_schema={})
+
+            for detail in details:
+                record.update(detail)
+
+        except Exception as exception:
+            # Emit the listing-level record rather than failing the stream. The most common cause is a
+            # 403 for a flow that requires sensitive-data scopes the connector was not granted.
+            logger.warning(
+                f"Failed to fetch the full definition for flow {flow_id}: {exception}. "
+                f"Emitting summary fields only. If this flow contains sensitive data, grant the matching "
+                f"'*.sensitive.read' scopes to the HubSpot app and re-run the sync."
+            )
 
 
 @dataclass
@@ -367,8 +487,17 @@ class EntitySchemaNormalization(TypeTransformer):
                 if "number" in target_type:
                     # do not cast numeric IDs into float, use integer instead
                     target_type = int if original_value.isnumeric() else float
-                    transformed_value = target_type(original_value.replace(",", ""))
-                    return transformed_value
+
+                    # In some cases, the returned value from Hubspot is non-numeric despite the discovered schema explicitly declaring a numeric type.
+                    # For example, a field with a type of "number" might return a string: "3092727991;3881228353;15895321999"
+                    # So, we attempt to cast the value to the declared type, and failing that, we log the error and return the original value.
+                    # This matches the previous behavior in the Python implementation.
+                    try:
+                        transformed_value = target_type(original_value.replace(",", ""))
+                        return transformed_value
+                    except ValueError:
+                        logger.exception(f"Could not cast field value {original_value} to {target_type}")
+                        return original_value
                 if "boolean" in target_type and original_value.lower() in ["true", "false"]:
                     transformed_value = str(original_value).lower() == "true"
                     return transformed_value
@@ -426,7 +555,7 @@ class EntitySchemaNormalization(TypeTransformer):
         try:
             return ab_datetime_parse(datetime_str)
         except (ValueError, TypeError, OverflowError) as ex:
-            logger.warning(f"Couldn't parse date/datetime string field. Timestamp field value: {datetime_str}. Ex: {ex}")
+            pass
 
         try:
             return ab_datetime_parse(int(datetime_str) // 1000)
@@ -527,10 +656,14 @@ class HubspotAssociationsExtractor(RecordExtractor):
             elif extracted:
                 raise ValueError(f"field_path should always point towards a list field in the response body")
 
+            # If no records were extracted, no need to call the associations retriever
+            if not records:
+                continue
+
             records_by_pk = {record["id"]: record for record in records}
             record_ids = [{"id": record["id"]} for record in records]
 
-            slices = self._associations_retriever.stream_slices()
+            slices = self._associations_retriever.stream_slicer.stream_slices()
 
             for _slice in slices:
                 # Append the list of extracted records so they are usable during interpolation of the JSON request body
@@ -615,6 +748,58 @@ def build_associations_retriever(
             config=config,
             parameters=parameters,
         ),
+        error_handler=HubspotErrorHandler(
+            backoff_strategies=[
+                WaitTimeFromHeaderBackoffStrategy(header="Retry-After", config=config, parameters=parameters),
+                ExponentialBackoffStrategy(config=config, parameters=parameters),
+            ],
+            response_filters=[
+                HttpResponseFilter(
+                    action="RATE_LIMITED",
+                    http_codes={429},
+                    error_message="HubSpot rate limit reached (429). Backoff based on 'Retry-After' header, then exponential backoff fallback.",
+                    config=config,
+                    parameters=parameters,
+                ),
+                HttpResponseFilter(
+                    action="RETRY",
+                    http_codes={502, 503},
+                    error_message="HubSpot server error (5xx). Retrying with exponential backoff...",
+                    config=config,
+                    parameters=parameters,
+                ),
+                HttpResponseFilter(
+                    action="REFRESH_TOKEN_THEN_RETRY",
+                    http_codes={401},
+                    error_message="Authentication to HubSpot has expired. Authentication will be retried, but if this issue persists, re-authenticate to restore access to HubSpot.",
+                    config=config,
+                    parameters=parameters,
+                ),
+                HttpResponseFilter(
+                    action="FAIL",
+                    http_codes={530},
+                    error_message="The user cannot be authorized with provided credentials. Please verify that your credentials are valid and try again.",
+                    config=config,
+                    parameters=parameters,
+                ),
+                HttpResponseFilter(
+                    action="FAIL",
+                    http_codes={403},
+                    error_message="Access denied (403). The authenticated user does not have permissions to access the resource.",
+                    config=config,
+                    parameters=parameters,
+                ),
+                HttpResponseFilter(
+                    action="FAIL",
+                    http_codes={400},
+                    error_message="Bad request (400). Please verify your credentials and try again.",
+                    config=config,
+                    parameters=parameters,
+                ),
+            ],
+            config=config,
+            parameters=parameters,
+        ),
         config=config,
         parameters=parameters,
     )
@@ -677,7 +862,11 @@ class HubspotCRMSearchPaginationStrategy(PaginationStrategy):
         if (last_page_size < self.page_size) or last_page_size == 0 or not response.json().get("paging"):
             return None
 
-        return {"after": last_page_token_value["after"] + last_page_size}
+        last_id_of_previous_chunk = last_page_token_value.get("id")
+        if last_id_of_previous_chunk:
+            return {"after": last_page_token_value["after"] + last_page_size, self.primary_key: last_id_of_previous_chunk}
+        else:
+            return {"after": last_page_token_value["after"] + last_page_size}
 
     def get_page_size(self) -> Optional[int]:
         return self.page_size
@@ -705,6 +894,7 @@ class HubspotCustomObjectsSchemaLoader(SchemaLoader):
 
     def _field_to_property_schema(self, field: Mapping[str, Any]) -> Mapping[str, Any]:
         field_type = field["type"]
+        treat_as_string = bool(self.config.get("treat_numbers_and_booleans_as_strings", False))
 
         if field_type in ["string", "enumeration", "phone_number", "object_coordinates", "json"]:
             return {"type": ["null", "string"]}
@@ -713,8 +903,12 @@ class HubspotCustomObjectsSchemaLoader(SchemaLoader):
         elif field_type == "date":
             return {"type": ["null", "string"], "format": "date"}
         elif field_type == "number":
+            if treat_as_string:
+                return {"type": ["null", "string"]}
             return {"type": ["null", "number"]}
         elif field_type == "boolean" or field_type == "bool":
+            if treat_as_string:
+                return {"type": ["null", "string"]}
             return {"type": ["null", "boolean"]}
         else:
             logger.warn(f"Field {field['name']} has unrecognized type: {field['type']} casting to string.")
@@ -740,6 +934,82 @@ class HubspotCustomObjectsSchemaLoader(SchemaLoader):
 
     def get_json_schema(self) -> Mapping[str, Any]:
         return self._schema
+
+
+@dataclass
+class HubspotAssociationStreamExtractor(RecordExtractor):
+    """
+    Flattens HubSpot association batch/read responses into individual records.
+
+    Transforms nested structure:
+    {
+      "results": [
+        {
+          "from": {"id": "123"},
+          "to": [
+            {
+              "toObjectId": 456,
+              "associationTypes": [
+                {"typeId": 3, "category": "HUBSPOT_DEFINED", "label": null}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    Into flat records:
+    {"from_id": "123", "to_id": "456", "association_type_id": 3, "category": "HUBSPOT_DEFINED", "label": null}
+    """
+
+    from_object: Union[InterpolatedString, str]
+    to_object: Union[InterpolatedString, str]
+    config: Config
+    parameters: InitVar[Mapping[str, Any]]
+    decoder: Decoder = field(default_factory=lambda: JsonDecoder(parameters={}))
+
+    def __post_init__(self, parameters: Mapping[str, Any]) -> None:
+        if isinstance(self.from_object, str):
+            self._from_object = InterpolatedString.create(self.from_object, parameters=parameters)
+        else:
+            self._from_object = self.from_object
+
+        if isinstance(self.to_object, str):
+            self._to_object = InterpolatedString.create(self.to_object, parameters=parameters)
+        else:
+            self._to_object = self.to_object
+
+    def extract_records(self, response: requests.Response) -> Iterable[Mapping[str, Any]]:
+        """
+        Extract and flatten association records from HubSpot batch/read API response.
+
+        Yields one record per association type (not per to_object).
+        Handles empty responses gracefully.
+        Ensures string IDs for schema consistency.
+        """
+        # Parse response JSON directly
+        body = response.json()
+        results = body.get("results", [])
+
+        for result in results:
+            from_obj = result.get("from", {})
+            from_id = str(from_obj.get("id", ""))
+
+            to_list = result.get("to", [])
+
+            for to_obj in to_list:
+                to_id = str(to_obj.get("toObjectId", ""))
+                association_types = to_obj.get("associationTypes", [])
+
+                # Emit one record per association type
+                for assoc_type in association_types:
+                    yield {
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "association_type_id": assoc_type.get("typeId"),
+                        "category": assoc_type.get("category"),
+                        "label": assoc_type.get("label"),
+                    }
 
 
 _TRUTHY_STRINGS = ("y", "yes", "t", "true", "on", "1")

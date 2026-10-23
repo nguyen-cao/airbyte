@@ -1,5 +1,5 @@
 ---
-products: oss-community, oss-enterprise
+products: oss-community
 ---
 
 import Tabs from '@theme/Tabs';
@@ -13,7 +13,7 @@ Secrets are sensitive information that should be kept confidential to protect th
 Airbyte's default behavior is to store connector secrets on your configured database. This will be stored in plain-text and not encrypted.
 :::
 
-Airbyte **highly recommends** storing connector secrets in an external secret manager to ensure secrets are not exposed. The currently supported Secret managers are: AWS Secrets Manager, Google Secrets Manager or Hashicorp Vault. Upon creating a new connector, secrets (e.g. OAuth tokens, database passwords) will be written to and read from the configured Secrets manager.
+Airbyte **highly recommends** storing connector secrets in an external secret manager to ensure secrets are not exposed. Airbyte supports AWS Secrets Manager, Google Secrets Manager, Azure Key Vault, and Hashicorp Vault. Upon creating a new connector, secrets (e.g. OAuth tokens, database passwords) will be written to and read from the configured Secrets manager.
 
 ## Secrets
 
@@ -56,6 +56,7 @@ stringData:
   "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/cloud-proj.iam.gserviceaccount.com"
 }
 ```
+
 </TabItem>
 
 <TabItem label="Azure Key Vault" value="Azure">
@@ -70,6 +71,7 @@ stringData:
   azure-key-vault-client-id: ## 3fc863e9-4740-4871-bdd4-456903a04d4e
   azure-key-vault-client-secret: ## KWP6egqixiQeQoKqFZuZq2weRbYoVxMH
 ```
+
 </TabItem>
 
 </Tabs>
@@ -83,10 +85,10 @@ Modifing the configuration of connector secret storage will cause all <i>existin
 
 If authenticating with credentials, ensure you've already created a Kubernetes secret containing both your AWS Secrets Manager access key ID, and secret access key. By default, secrets are expected in the `airbyte-config-secrets` Kubernetes secret, under the `aws-secret-manager-access-key-id` and `aws-secret-manager-secret-access-key` keys. Steps to configure these are in the above [prerequisites](#secrets).
 
-```yaml
+```yaml title="values.yaml"
 global:
   secretsManager:
-    type: awsSecretManager
+    type: AWS_SECRET_MANAGER
     secretName: "airbyte-config-secrets" # Name of your Kubernetes secret.
     awsSecretManager:
       region: <aws-region>
@@ -108,13 +110,14 @@ To decrypt secrets in the secret manager with AWS KMS, configure the `kms` field
 
 Ensure you've already created a Kubernetes secret containing the credentials blob for the service account to be assumed by the cluster. By default, secrets are expected in the `airbyte-config-secrets` Kubernetes secret, under a `gcp.json` file. Steps to configure these are in the above [prerequisites](#secrets). For simplicity, we recommend provisioning a single service account with access to both GCS and GSM.
 
-```yaml
+```yaml title="values.yaml"
 global:
   secretsManager:
-    type: googleSecretManager
+    type: GOOGLE_SECRET_MANAGER
     secretName: "airbyte-config-secrets" # Name of your Kubernetes secret.
     googleSecretManager:
       projectId: <project-id>
+      region: "" ## Optional - e.g. us-central1
       credentialsSecretKey: gcp.json
 ```
 
@@ -122,19 +125,38 @@ global:
 
 <TabItem label="Azure Key Vault" value="Azure">
 
-```yaml
+```yaml title="values.yaml"
 global:
   secretsManager:
-    type: azureKeyVault
+    type: AZURE_KEY_VAULT
     secretsManagerSecretName: "airbyte-config-secrets" # Name of your Kubernetes secret.
     azureKeyVault:
       vaultUrl: ## https://my-vault.vault.azure.net/
       tenantId: ## 3fc863e9-4740-4871-bdd4-456903a04d4e
+      clientId: ""
+      clientIdSecretKey: ""
+      clientSecret: ""
+      clientSecretSecretKey: ""
       tags: ## Optional - You may add tags to new secrets created by Airbyte.
         - key: ## e.g. team
           value: ## e.g. deployments
         - key: business-unit
           value: engineering
+```
+
+</TabItem>
+<TabItem label="HashiCorp Vault" value="Vault">
+
+```yaml title="values.yaml"
+global:
+  secretsManager:
+    type: VAULT
+    secretsManagerSecretName: "airbyte-config-secrets" # Name of your Kubernetes secret.
+    vault:
+      address: ""
+      prefix: ""
+      authToken: ""
+      authTokenSecretKey: ""
 ```
 
 </TabItem>

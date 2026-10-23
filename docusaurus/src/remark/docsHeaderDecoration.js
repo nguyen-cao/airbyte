@@ -1,10 +1,28 @@
 const { getFromPaths, toAttributes } = require("../helpers/objects");
 const { isDocsPage, getRegistryEntry } = require("./utils");
+const { parseCDKVersion } = require("../scripts/connector_registry");
 const {
-  getLatestPythonCDKVersion,
-  parseCDKVersion,
-} = require("../connector_registry");
+  getDefaultDataWorkersForSource,
+} = require("../scripts/data-worker-consumption");
+const { discoverAgentConnectorSlugs } = require("../plugins/agentConnectors");
 const visit = require("unist-util-visit").visit;
+
+const AGENT_DESTINATIONS = ["bigquery", "snowflake"];
+
+let agentSourceSlugs = null;
+
+const isAgentConnector = (dockerRepository) => {
+  const match = /^airbyte\/(source|destination)-(.+)$/.exec(
+    dockerRepository ?? "",
+  );
+  if (!match) return false;
+  const [, connectorType, slug] = match;
+  if (connectorType === "destination") return AGENT_DESTINATIONS.includes(slug);
+  if (agentSourceSlugs === null) {
+    agentSourceSlugs = discoverAgentConnectorSlugs();
+  }
+  return agentSourceSlugs.includes(slug);
+};
 
 /**
  * Convert a boolean to a string
@@ -19,57 +37,58 @@ const plugin = () => {
     if (!docsPageInfo.isDocsPage) return;
 
     const registryEntry = await getRegistryEntry(vfile);
-
-    const latestPythonCdkVersion = await getLatestPythonCDKVersion();
-
     if (!registryEntry) return;
+
+    const rawCDKVersion = getFromPaths(
+      registryEntry,
+      "packageInfo.cdk_version",
+    );
 
     let firstHeading = true;
 
     visit(ast, "heading", (node) => {
       if (firstHeading && node.depth === 1 && node.children.length === 1) {
         const originalTitle = node.children[0].value;
-        const originalId = node.data.hProperties.id;
 
-        const rawCDKVersion = getFromPaths(
-          registryEntry,
-          "packageInfo_[oss|cloud].cdk_version",
-        );
         const syncSuccessRate = getFromPaths(
           registryEntry,
-          "generated_[oss|cloud].metrics.[all|cloud|oss].sync_success_rate",
+          "generated.metrics.[all|cloud|oss].sync_success_rate",
         );
         const usageRate = getFromPaths(
           registryEntry,
-          "generated_[oss|cloud].metrics.[all|cloud|oss].usage",
+          "generated.metrics.[all|cloud|oss].usage",
         );
+        const defaultDataWorkers =
+          getDefaultDataWorkersForSource(registryEntry);
         const lastUpdated = getFromPaths(
           registryEntry,
-          "generated_[oss|cloud].source_file_info.metadata_last_modified",
+          "generated.source_file_info.metadata_last_modified",
         );
 
-        const { version, isLatest, url } = parseCDKVersion(
-          rawCDKVersion,
-          latestPythonCdkVersion,
-        );
+        const { version, isLatest, url } = parseCDKVersion(rawCDKVersion, null);
 
         const attrDict = {
           isOss: registryEntry.is_oss,
           isCloud: registryEntry.is_cloud,
-          supportLevel: registryEntry.supportLevel_oss,
-          dockerImageTag: registryEntry.dockerImageTag_oss,
-          iconUrl: registryEntry.iconUrl_oss,
+          supportLevel: registryEntry.supportLevel,
+          dockerImageTag: registryEntry.dockerImageTag,
+          iconUrl: registryEntry.iconUrl,
           github_url: registryEntry.github_url,
           issue_url: registryEntry.issue_url,
           originalTitle,
-          originalId,
           cdkVersion: version,
-          isLatestCDKString: boolToBoolString(isLatest),
+          ...(isLatest !== undefined && {
+            isLatestCDKString: boolToBoolString(isLatest),
+          }),
           cdkVersionUrl: url,
           syncSuccessRate,
           usageRate,
+          defaultDataWorkers,
           lastUpdated,
           definitionId: registryEntry.definitionId,
+          isAgent: boolToBoolString(
+            isAgentConnector(registryEntry.dockerRepository),
+          ),
         };
 
         firstHeading = false;

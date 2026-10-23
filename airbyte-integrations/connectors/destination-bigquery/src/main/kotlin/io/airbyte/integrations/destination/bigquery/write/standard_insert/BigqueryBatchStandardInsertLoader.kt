@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.bigquery.write.standard_insert
@@ -9,39 +9,60 @@ import com.google.cloud.bigquery.BigQueryException
 import com.google.cloud.bigquery.FormatOptions
 import com.google.cloud.bigquery.JobId
 import com.google.cloud.bigquery.JobInfo
+import com.google.cloud.bigquery.JobStatistics
+import com.google.cloud.bigquery.JobStatus
+import com.google.cloud.bigquery.Schema
 import com.google.cloud.bigquery.TableDataWriteChannel
 import com.google.cloud.bigquery.TableId
 import com.google.cloud.bigquery.WriteChannelConfiguration
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings
 import io.airbyte.cdk.ConfigErrorException
+import io.airbyte.cdk.load.command.DestinationCatalog
 import io.airbyte.cdk.load.command.DestinationStream
+import io.airbyte.cdk.load.config.DataChannelFormat
 import io.airbyte.cdk.load.message.DestinationRecordRaw
+import io.airbyte.cdk.load.orchestration.db.direct_load_table.DirectLoadTableExecutionConfig
 import io.airbyte.cdk.load.orchestration.db.legacy_typing_deduping.TableCatalogByDescriptor
 import io.airbyte.cdk.load.orchestration.db.legacy_typing_deduping.TypingDedupingExecutionConfig
 import io.airbyte.cdk.load.write.DirectLoader
 import io.airbyte.cdk.load.write.DirectLoaderFactory
 import io.airbyte.cdk.load.write.StreamStateStore
 import io.airbyte.integrations.destination.bigquery.BigQueryUtils
+import io.airbyte.integrations.destination.bigquery.copy.BigqueryS3Copy
+import io.airbyte.integrations.destination.bigquery.copy.StandardInsertArchiveBatch
 import io.airbyte.integrations.destination.bigquery.formatter.BigQueryRecordFormatter
+import io.airbyte.integrations.destination.bigquery.formatter.ProtoToBigQueryStandardInsertRecordFormatter
 import io.airbyte.integrations.destination.bigquery.spec.BatchedStandardInsertConfiguration
 import io.airbyte.integrations.destination.bigquery.spec.BigqueryConfiguration
+import io.airbyte.integrations.destination.bigquery.toPrettyString
 import io.airbyte.integrations.destination.bigquery.write.standard_insert.BigqueryBatchStandardInsertsLoaderFactory.Companion.CONFIG_ERROR_MSG
 import io.airbyte.integrations.destination.bigquery.write.standard_insert.BigqueryBatchStandardInsertsLoaderFactory.Companion.HTTP_STATUS_CODE_FORBIDDEN
 import io.airbyte.integrations.destination.bigquery.write.standard_insert.BigqueryBatchStandardInsertsLoaderFactory.Companion.HTTP_STATUS_CODE_NOT_FOUND
+import io.github.oshai.kotlinlogging.KotlinLogging
 import io.micronaut.context.annotation.Requires
 import io.micronaut.context.condition.Condition
 import io.micronaut.context.condition.ConditionContext
+import jakarta.inject.Named
 import jakarta.inject.Singleton
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+
+private val logger = KotlinLogging.logger {}
+
+interface RecordFormatter {
+    fun formatRecord(record: DestinationRecordRaw): String
+}
 
 class BigqueryBatchStandardInsertsLoader(
     private val bigquery: BigQuery,
     private val writeChannelConfiguration: WriteChannelConfiguration,
     private val job: JobId,
+    private val recordFormatter: RecordFormatter,
+    private val archiveBatch: StandardInsertArchiveBatch? = null,
 ) : DirectLoader {
-    private val recordFormatter = BigQueryRecordFormatter()
     // a TableDataWriteChannel holds (by default) a 15MB buffer in memory.
     // so we start out by writing to a BAOS, which grows dynamically.
     // when the BAOS reaches 15MB, we create the TableDataWriteChannel and switch over
@@ -52,41 +73,127 @@ class BigqueryBatchStandardInsertsLoader(
     // so we can't just flush+close a TableDataWriteChannel as soon as we reach 15MB.
     private var buffer: ByteArrayOutputStream? = ByteArrayOutputStream()
     private lateinit var writer: TableDataWriteChannel
+    private var closed = false
 
-    @SuppressFBWarnings("RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE")
-    override fun accept(record: DestinationRecordRaw): DirectLoader.DirectLoadResult {
-        val formattedRecord = recordFormatter.formatRecord(record)
-        val byteArray =
-            "$formattedRecord${System.lineSeparator()}".toByteArray(StandardCharsets.UTF_8)
+    override suspend fun accept(record: DestinationRecordRaw): DirectLoader.DirectLoadResult {
+        check(!closed) { "BigQuery standard insert loader is closed" }
+        try {
+            currentCoroutineContext().ensureActive()
+            val formattedRecord = recordFormatter.formatRecord(record)
+            val byteArray =
+                "$formattedRecord${System.lineSeparator()}".toByteArray(StandardCharsets.UTF_8)
+            archiveBatch?.append(byteArray)
 
-        if (this::writer.isInitialized) {
-            writer.write(ByteBuffer.wrap(byteArray))
-        } else {
-            buffer!!.write(byteArray)
-            // the default chunk size on the TableDataWriteChannel is 15MB,
-            // so switch to writing to a real writechannel when we reach that size
-            if (buffer!!.size() > 15 * 1024 * 1024) {
+            if (this::writer.isInitialized) {
+                writeFully(byteArray)
+            } else {
+                buffer!!.write(byteArray)
+                // the default chunk size on the TableDataWriteChannel is 15MB,
+                // so switch to writing to a real writechannel when we reach that size
+                if (buffer!!.size() > 15 * 1024 * 1024) {
+                    switchToWriteChannel()
+                }
+            }
+
+            // rely on the CDK to tell us when to finish()
+            return DirectLoader.Incomplete
+        } catch (t: Throwable) {
+            closeResources(t)
+            throw t
+        }
+    }
+
+    override suspend fun finish() {
+        check(!closed) { "BigQuery standard insert loader is closed" }
+        try {
+            currentCoroutineContext().ensureActive()
+            // Parts have already been uploading while records were written. Start the final
+            // partial part/object now, in parallel with the final buffered BigQuery write,
+            // channel close, and load-job completion.
+            // complete() below is the durability barrier for both destinations before CDK ACKs.
+            archiveBatch?.seal()
+            if (!this::writer.isInitialized) {
                 switchToWriteChannel()
             }
+            writer.close()
+            val loadJob = checkNotNull(writer.job) { "BigQuery load job is missing" }
+            BigQueryUtils.waitForJobFinish(loadJob)
+            val completedJob = checkNotNull(loadJob.reload()) { "BigQuery load job disappeared" }
+            check(
+                completedJob.status.state == JobStatus.State.DONE &&
+                    completedJob.status.error == null,
+            ) {
+                "BigQuery load job did not complete successfully: ${completedJob.status}"
+            }
+            val stats = completedJob.getStatistics<JobStatistics.LoadStatistics>()
+            if (stats.badRecords > 0) {
+                // This should be impossible: the load job uses the default setting of
+                // maxBadRecords=0,
+                // so the job is supposed to fail if there were any bad records.
+                throw RuntimeException(
+                    "${writeChannelConfiguration.destinationTable.toPrettyString()}: Nonzero bad records detected: ${stats.badRecords}",
+                )
+            }
+            currentCoroutineContext().ensureActive()
+            archiveBatch?.complete(stats.outputRows)
+            currentCoroutineContext().ensureActive()
+            closeResources()
+            logger.info {
+                "Finished loading data into table ${writeChannelConfiguration.destinationTable.toPrettyString()}. ${stats.outputRows} rows loaded; ${stats.badRecords} bad records."
+            }
+        } catch (t: Throwable) {
+            closeResources(t)
+            throw t
         }
-
-        // rely on the CDK to tell us when to finish()
-        return DirectLoader.Incomplete
     }
 
-    override fun finish() {
-        if (!this::writer.isInitialized) {
-            switchToWriteChannel()
+    // The CDK only reaches close() without a successful finish() when it is abandoning this batch
+    // (e.g. another task failed or the sync was cancelled), and it rethrows anything close() throws
+    // in place of the original failure. So log cleanup failures here instead of throwing.
+    override fun close() {
+        try {
+            closeResources()
+        } catch (t: Throwable) {
+            logger.warn(t) {
+                "Failed to clean up abandoned batch for table ${writeChannelConfiguration.destinationTable.toPrettyString()}"
+            }
         }
-        writer.close()
-        BigQueryUtils.waitForJobFinish(writer.job)
     }
 
-    override fun close() {}
+    private fun closeResources(primary: Throwable? = null) {
+        if (closed) return
+        closed = true
+        buffer = null
+        var failure = primary
+        try {
+            archiveBatch?.close()
+        } catch (t: Throwable) {
+            if (failure == null) failure = t else if (failure !== t) failure.addSuppressed(t)
+        }
+        // Never close an unfinished BigQuery write channel here: TableDataWriteChannel.close()
+        // commits the resumable upload, which starts a load job for the partial batch. Dropping
+        // the channel instead leaves the upload session unfinalized, so no load job is created.
+        if (primary == null) failure?.let { throw it }
+    }
+
+    private fun writeFully(bytes: ByteArray) {
+        val source = ByteBuffer.wrap(bytes)
+        var stalledWrites = 0
+        while (source.hasRemaining()) {
+            val position = source.position()
+            writer.write(source)
+            if (source.position() <= position) {
+                if (++stalledWrites >= 3) {
+                    throw IOException("BigQuery write channel made no progress after 3 attempts")
+                }
+            } else {
+                stalledWrites = 0
+            }
+        }
+    }
 
     // Somehow spotbugs thinks that `writer.write(ByteBuffer.wrap(byteArray))` is a redundant null
     // check...
-    @SuppressFBWarnings(value = ["RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE"])
     private fun switchToWriteChannel() {
         writer =
             try {
@@ -101,7 +208,7 @@ class BigqueryBatchStandardInsertsLoader(
         val byteArray = buffer!!.toByteArray()
         // please GC this object :)
         buffer = null
-        writer.write(ByteBuffer.wrap(byteArray))
+        writeFully(byteArray)
     }
 }
 
@@ -115,24 +222,53 @@ class BigqueryConfiguredForBatchStandardInserts : Condition {
 @Requires(condition = BigqueryConfiguredForBatchStandardInserts::class)
 @Singleton
 class BigqueryBatchStandardInsertsLoaderFactory(
-    private val bigquery: BigQuery,
+    private val catalog: DestinationCatalog,
+    @Named("jobProjectBigquery") private val jobProjectBigquery: BigQuery,
     private val config: BigqueryConfiguration,
     private val tableCatalog: TableCatalogByDescriptor,
-    private val streamStateStore: StreamStateStore<TypingDedupingExecutionConfig>,
+    private val typingDedupingStreamStateStore: StreamStateStore<TypingDedupingExecutionConfig>?,
+    private val directLoadStreamStateStore: StreamStateStore<DirectLoadTableExecutionConfig>?,
+    @Named("dataChannelFormat") private val dataChannelFormat: DataChannelFormat,
+    private val archive: BigqueryS3Copy,
 ) : DirectLoaderFactory<BigqueryBatchStandardInsertsLoader> {
     override fun create(
         streamDescriptor: DestinationStream.Descriptor,
         part: Int,
     ): BigqueryBatchStandardInsertsLoader {
-        val rawTableName = tableCatalog[streamDescriptor]!!.tableNames.rawTableName!!
-        val rawTableNameSuffix = streamStateStore.get(streamDescriptor)!!.rawTableSuffix
-
-        val writeChannelConfiguration =
-            WriteChannelConfiguration.newBuilder(
-                    TableId.of(rawTableName.namespace, rawTableName.name + rawTableNameSuffix)
+        val tableId: TableId
+        val schema: Schema
+        val tableNameInfo = tableCatalog[streamDescriptor]!!
+        if (config.legacyRawTablesOnly) {
+            val rawTableName = tableNameInfo.tableNames.rawTableName!!
+            // Wait for the state store to be populated by the coordinating StreamLoader
+            val rawTableSuffix =
+                waitForStateStore(typingDedupingStreamStateStore!!, streamDescriptor).rawTableSuffix
+            tableId =
+                TableId.of(
+                    config.projectId,
+                    rawTableName.namespace,
+                    rawTableName.name + rawTableSuffix,
                 )
+            schema = BigQueryRecordFormatter.SCHEMA_V2
+        } else {
+            // Wait for the state store to be populated by the coordinating StreamLoader
+            val executionConfig = waitForStateStore(directLoadStreamStateStore!!, streamDescriptor)
+            tableId =
+                TableId.of(
+                    config.projectId,
+                    executionConfig.tableName.namespace,
+                    executionConfig.tableName.name,
+                )
+            schema =
+                BigQueryRecordFormatter.getDirectLoadSchema(
+                    catalog.getStream(streamDescriptor),
+                    tableNameInfo.columnNameMapping,
+                )
+        }
+        val writeChannelConfiguration =
+            WriteChannelConfiguration.newBuilder(tableId)
                 .setCreateDisposition(JobInfo.CreateDisposition.CREATE_IF_NEEDED)
-                .setSchema(BigQueryRecordFormatter.SCHEMA_V2)
+                .setSchema(schema)
                 // new-line delimited json.
                 .setFormatOptions(FormatOptions.json())
                 .build()
@@ -141,13 +277,58 @@ class BigqueryBatchStandardInsertsLoaderFactory(
             JobId.newBuilder()
                 .setRandomJob()
                 .setLocation(config.datasetLocation.region)
-                .setProject(bigquery.options.projectId)
+                .setProject(config.jobProjectId)
                 .build()
 
+        val formatter: RecordFormatter =
+            when (dataChannelFormat) {
+                DataChannelFormat.PROTOBUF -> {
+                    ProtoToBigQueryStandardInsertRecordFormatter(
+                        catalog.getStream(streamDescriptor).airbyteValueProxyFieldAccessors,
+                        tableNameInfo.columnNameMapping,
+                        catalog.getStream(streamDescriptor),
+                        legacyRawTablesOnly = config.legacyRawTablesOnly,
+                    )
+                }
+                else -> {
+                    BigQueryRecordFormatter(
+                        tableNameInfo.columnNameMapping,
+                        legacyRawTablesOnly = config.legacyRawTablesOnly,
+                    )
+                }
+            }
+
         return BigqueryBatchStandardInsertsLoader(
-            bigquery,
+            jobProjectBigquery,
             writeChannelConfiguration,
             jobId,
+            formatter,
+            archive
+                .context(catalog.getStream(streamDescriptor))
+                ?.let(archive::startStandardInsertBatch),
+        )
+    }
+
+    private fun <S> waitForStateStore(
+        stateStore: StreamStateStore<S>,
+        streamDescriptor: DestinationStream.Descriptor,
+    ): S {
+        // Poll the state store until it's populated by the coordinating StreamLoader thread
+        var attempts = 0
+        val maxAttempts = 60 * 60 // 1 hour
+
+        while (attempts < maxAttempts) {
+            val state = stateStore.get(streamDescriptor)
+            if (state != null) {
+                return state
+            }
+
+            Thread.sleep(1000)
+            attempts++
+        }
+
+        throw RuntimeException(
+            "Timeout waiting for StreamStateStore to be populated for stream $streamDescriptor. This indicates a coordination issue between workers.",
         )
     }
 
@@ -162,6 +343,7 @@ class BigqueryBatchStandardInsertsLoaderFactory(
             |   2. Make sure that the actual destination schema's location corresponds to the location provided in the connector's config.
             |   3. Try to change the "Destination schema" from "Mirror Source Structure" (if it's set) to the "Destination Default" option.
             |More details:
-            |""".trimMargin()
+            |"""
+                .trimMargin()
     }
 }

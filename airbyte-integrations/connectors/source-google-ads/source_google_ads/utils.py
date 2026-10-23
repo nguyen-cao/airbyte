@@ -14,11 +14,11 @@ from typing import Any, Callable, Generator, Iterable, MutableMapping, Optional,
 
 import pendulum
 from google.ads.googleads.errors import GoogleAdsException
-from google.ads.googleads.v18.errors.types.authentication_error import AuthenticationErrorEnum
-from google.ads.googleads.v18.errors.types.authorization_error import AuthorizationErrorEnum
-from google.ads.googleads.v18.errors.types.query_error import QueryErrorEnum
-from google.ads.googleads.v18.errors.types.quota_error import QuotaErrorEnum
-from google.ads.googleads.v18.errors.types.request_error import RequestErrorEnum
+from google.ads.googleads.v23.errors.types.authentication_error import AuthenticationErrorEnum
+from google.ads.googleads.v23.errors.types.authorization_error import AuthorizationErrorEnum
+from google.ads.googleads.v23.errors.types.query_error import QueryErrorEnum
+from google.ads.googleads.v23.errors.types.quota_error import QuotaErrorEnum
+from google.ads.googleads.v23.errors.types.request_error import RequestErrorEnum
 from google.api_core.exceptions import Unauthenticated
 
 from airbyte_cdk.models import FailureType
@@ -35,8 +35,6 @@ def get_resource_name(stream_name: str) -> str:
 
 # maps stream name to name of resource in Google Ads
 REPORT_MAPPING = {
-    "account_performance_report": "customer",
-    "ad_group_ad_legacy": "ad_group_ad",
     "ad_group_bidding_strategy": "ad_group",
     "ad_listing_group_criterion": "ad_group_criterion",
     "campaign_real_time_bidding_settings": "campaign",
@@ -111,10 +109,11 @@ def traced_exception(
                 )
 
         elif is_error_type(query_error, QueryErrorEnum.QueryError.UNRECOGNIZED_FIELD):
+            query_label = f'"{query_name}" ' if query_name else ""
             message = (
-                f"The Custom Query: `{query_name}` has {error.message.lower()} Please make sure the field exists or name entered is valid."
+                f"Custom query {query_label}references an unrecognized field for the queried resource."
+                " Verify all selected fields are valid for the resource."
             )
-            # additionally log the error for visability during `check_connection` in UI.
             logger.error(message)
 
         elif query_error:

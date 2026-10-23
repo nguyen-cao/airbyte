@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 package io.airbyte.integrations.destination.bigquery
 
@@ -9,12 +9,11 @@ import com.google.cloud.RetryOption
 import com.google.cloud.bigquery.*
 import com.google.common.collect.ImmutableList
 import com.google.common.collect.ImmutableMap
+import io.airbyte.cdk.ConfigErrorException
 import io.airbyte.cdk.load.message.Meta
-import io.airbyte.cdk.load.util.Jsons
 import java.util.*
 import java.util.stream.Collectors
 import org.apache.commons.lang3.StringUtils
-import org.apache.commons.lang3.tuple.ImmutablePair
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.threeten.bp.Duration
@@ -22,53 +21,22 @@ import org.threeten.bp.Duration
 object BigQueryUtils {
     private val LOGGER: Logger = LoggerFactory.getLogger(BigQueryUtils::class.java)
     private const val USER_AGENT_FORMAT = "%s (GPN: Airbyte)"
-    private const val CHECK_TEST_DATASET_SUFFIX = "_airbyte_check_stage_tmp_"
-    private const val CHECK_TEST_TMP_TABLE_NAME = "test_connection_table_name"
-
-    @JvmStatic
-    fun executeQuery(
-        bigquery: BigQuery,
-        queryConfig: QueryJobConfiguration?
-    ): ImmutablePair<Job, String> {
-        val jobId = JobId.of(UUID.randomUUID().toString())
-        val queryJob = bigquery.create(JobInfo.newBuilder(queryConfig).setJobId(jobId).build())
-        return executeQuery(queryJob)
-    }
-
-    fun executeQuery(queryJob: Job): ImmutablePair<Job, String> {
-        val completedJob = waitForQuery(queryJob)
-        if (completedJob == null) {
-            LOGGER.error("Job no longer exists:$queryJob")
-            throw RuntimeException("Job no longer exists")
-        } else if (completedJob.status.error != null) {
-            // You can also look at queryJob.getStatus().getExecutionErrors() for all
-            // errors and not just the latest one.
-            return ImmutablePair.of(null, (completedJob.status.error.toString()))
-        }
-
-        return ImmutablePair.of(completedJob, null)
-    }
-
-    fun waitForQuery(queryJob: Job): Job? {
-        try {
-            val job = queryJob.waitFor()
-            return job
-        } catch (e: Exception) {
-            LOGGER.error("Failed to wait for a query job:$queryJob")
-            throw RuntimeException(e)
-        }
-    }
 
     @JvmStatic
     fun getOrCreateDataset(
         bigquery: BigQuery,
         datasetId: String?,
-        datasetLocation: String?
+        datasetLocation: String?,
     ): Dataset {
         var dataset = bigquery.getDataset(datasetId)
         if (dataset == null || !dataset.exists()) {
             val datasetInfo = DatasetInfo.newBuilder(datasetId).setLocation(datasetLocation).build()
             dataset = bigquery.create(datasetInfo)
+        }
+        if (dataset.location != datasetLocation) {
+            throw ConfigErrorException(
+                "Expected dataset $datasetId to be in location $datasetLocation, but it was in ${dataset.location}. You should either recreate the dataset manually in $datasetLocation, update your destination settings to use location ${dataset.location}, or configure this connection to use a different dataset.",
+            )
         }
         return dataset
     }
@@ -82,7 +50,7 @@ object BigQueryUtils {
      * @param tableId equivalent to table name
      * @param schema representation for table schema
      * @return Table BigQuery table object to be referenced for deleting, otherwise empty meaning
-     * table was not successfully created
+     *   table was not successfully created
      */
     @JvmStatic
     fun createPartitionedTableIfNotExists(bigquery: BigQuery, tableId: TableId?, schema: Schema?) {
@@ -118,28 +86,6 @@ object BigQueryUtils {
         }
     }
 
-    @JvmStatic
-    fun getGcsJsonNodeConfig(config: JsonNode): JsonNode {
-        val loadingMethod = config[BigQueryConsts.LOADING_METHOD]
-        return Jsons.valueToTree(
-            ImmutableMap.builder<Any, Any>()
-                .put(BigQueryConsts.GCS_BUCKET_NAME, loadingMethod[BigQueryConsts.GCS_BUCKET_NAME])
-                .put(BigQueryConsts.GCS_BUCKET_PATH, loadingMethod[BigQueryConsts.GCS_BUCKET_PATH])
-                .put(BigQueryConsts.GCS_BUCKET_REGION, getDatasetLocation(config))
-                .put(BigQueryConsts.CREDENTIAL, loadingMethod[BigQueryConsts.CREDENTIAL])
-                .put(
-                    BigQueryConsts.FORMAT,
-                    Jsons.readTree(
-                        """{
-                          "format_type": "CSV",
-                          "flattening": "No flattening"
-                        }""".trimIndent()
-                    )
-                )
-                .build()
-        )
-    }
-
     /** @return a default schema name based on the config. */
     @JvmStatic
     fun getDatasetId(config: JsonNode): String {
@@ -153,37 +99,13 @@ object BigQueryUtils {
                 String.format(
                     "Project ID included in Dataset ID must match Project ID field's value: Project ID is `%s`, but you specified `%s` in Dataset ID",
                     projectId,
-                    projectIdPart
+                    projectIdPart,
                 )
             }
         }
         // if colonIndex is -1, then this returns the entire string
         // otherwise it returns everything after the colon
         return datasetId.substring(colonIndex + 1)
-    }
-
-    @JvmStatic
-    fun getDatasetLocation(config: JsonNode): String {
-        return if (config.has(BigQueryConsts.CONFIG_DATASET_LOCATION)) {
-            config[BigQueryConsts.CONFIG_DATASET_LOCATION].asText()
-        } else {
-            "US"
-        }
-    }
-
-    @JvmStatic
-    fun getLoadingMethod(config: JsonNode): UploadingMethod {
-        val loadingMethod = config[BigQueryConsts.LOADING_METHOD]
-        if (
-            loadingMethod != null &&
-                BigQueryConsts.GCS_STAGING == loadingMethod[BigQueryConsts.METHOD].asText()
-        ) {
-            LOGGER.info("Selected loading method is set to: " + UploadingMethod.GCS)
-            return UploadingMethod.GCS
-        } else {
-            LOGGER.info("Selected loading method is set to: " + UploadingMethod.STANDARD)
-            return UploadingMethod.STANDARD
-        }
     }
 
     @Throws(InterruptedException::class)
@@ -201,20 +123,20 @@ object BigQueryUtils {
                     LOGGER.error(
                         "Job {} failed with errors {}",
                         completedJob.jobId,
-                        completedJob.status.error.toString()
+                        completedJob.status.error.toString(),
                     )
                     throw RuntimeException(
                         "Fail to complete a load job in big query, Job id: " +
                             completedJob.jobId +
                             ", with error: " +
-                            completedJob.status.error
+                            completedJob.status.error,
                     )
                 } else {
                     // job completed successfully
                     LOGGER.info(
                         "Job {} completed successfully, job info {}",
                         completedJob.jobId,
-                        completedJob
+                        completedJob,
                     )
                 }
             } catch (e: BigQueryException) {
@@ -237,7 +159,7 @@ object BigQueryUtils {
             errors
                 .stream()
                 .map { obj: BigQueryError -> obj.toString() }
-                .collect(Collectors.joining(",\n "))
+                .collect(Collectors.joining(",\n ")),
         )
     }
 
@@ -255,3 +177,5 @@ object BigQueryUtils {
                 .map { name: String -> name.replace("airbyte/", "").replace(":", "/") }
                 .orElse("destination-bigquery")
 }
+
+fun TableId.toPrettyString() = "${this.dataset}.${this.table}"

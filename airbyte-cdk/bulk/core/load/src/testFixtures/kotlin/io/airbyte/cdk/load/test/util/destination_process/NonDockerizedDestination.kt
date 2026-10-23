@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.test.util.destination_process
@@ -60,7 +60,7 @@ class NonDockerizedDestination(
     // The destination has a runBlocking inside WriteOperation.
     // This means that normal coroutine cancellation doesn't work.
     // So we start our own thread pool, which we can forcibly kill if needed.
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = Executors.newFixedThreadPool(4)
     private val coroutineDispatcher = executor.asCoroutineDispatcher()
     private val file = File("/tmp/test_file")
     private val writeLock = Mutex()
@@ -106,7 +106,7 @@ class NonDockerizedDestination(
                         EnvVarConstants.DATA_CHANNEL_SOCKET_PATHS to
                             socketWriters.joinToString(",") { it.socketPath },
                         EnvVarConstants.NAMESPACE_MAPPER_CONFIG_PATH to
-                            namespaceMappingConfigPath.toString()
+                            namespaceMappingConfigPath.toString(),
                     )
                 }
             }
@@ -142,8 +142,9 @@ class NonDockerizedDestination(
                             destination.results.traces(),
                             destination.results.states(),
                         )
+                    } finally {
+                        destinationComplete.complete(Unit)
                     }
-                    destinationComplete.complete(Unit)
                 }
             }
             .invokeOnCompletion { executor.shutdownNow() }
@@ -152,16 +153,23 @@ class NonDockerizedDestination(
     override suspend fun sendMessage(string: String) {
         writeLock.withLock {
             destinationDataChannels[onChannel.rotate(destinationDataChannels.size)].write(
-                string.toByteArray()
+                string.toByteArray(),
             )
         }
     }
 
-    override suspend fun sendMessage(message: InputMessage, broadcast: Boolean) {
+    override suspend fun sendMessage(
+        message: InputMessage,
+        broadcast: Boolean,
+        useSingleSocket: Boolean,
+    ) {
         writeLock.withLock {
             val channelsToSendTo =
                 if (broadcast) {
                     destinationDataChannels
+                } else if (useSingleSocket) {
+                    // Use only the first socket to preserve message ordering
+                    arrayOf(destinationDataChannels[0])
                 } else {
                     arrayOf(destinationDataChannels[onChannel.rotate(destinationDataChannels.size)])
                 }
@@ -221,7 +229,7 @@ class NonDockerizedDestinationFactory(
             dataChannelMedium = dataChannelMedium,
             dataChannelFormat = dataChannelFormat,
             namespaceMappingConfig = namespaceMappingConfig,
-            *featureFlags
+            *featureFlags,
         )
     }
 }

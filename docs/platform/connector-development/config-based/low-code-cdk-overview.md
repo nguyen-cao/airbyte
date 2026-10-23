@@ -1,6 +1,10 @@
 # Low-code connector development
 
-Airbyte's low-code framework enables you to build source connectors for REST APIs via a [connector builder UI](../connector-builder-ui/overview.md) or by modifying boilerplate YAML files via terminal or text editor. Low-code CDK is a part of Python CDK that provides a mapping from connector manifest YAML files to actual behavior implementations.
+Airbyte's low-code framework enables you to build source connectors for REST APIs via a [connector builder UI](../connector-builder-ui/overview.md) or by modifying boilerplate YAML files via terminal or text editor. The low-code CDK is a part of the Python CDK that provides a mapping from connector manifest YAML files to actual behavior implementations.
+
+:::info
+Almost all YAML capabilities are supported in the Connector Builder UI. If you don't want to write YAML, [use the UI](../connector-builder-ui/overview) instead.
+:::
 
 ## Why low-code?
 
@@ -90,9 +94,9 @@ For a deep dive into each of the components, refer to [Understanding the YAML fi
 
 For examples of production-ready config-based connectors, refer to:
 
-- [Greenhouse](https://github.com/airbytehq/airbyte/tree/master/airbyte-integrations/connectors/source-greenhouse/source_greenhouse/manifest.yaml)
-- [Sendgrid](https://github.com/airbytehq/airbyte/blob/master/airbyte-integrations/connectors/source-sendgrid/source_sendgrid/manifest.yaml)
-- [Sentry](https://github.com/airbytehq/airbyte/blob/master/airbyte-integrations/connectors/source-sentry/source_sentry/manifest.yaml)
+- [Greenhouse](https://github.com/airbytehq/airbyte/tree/master/airbyte-integrations/connectors/source-greenhouse/manifest.yaml)
+- [Sendgrid](https://github.com/airbytehq/airbyte/blob/master/airbyte-integrations/connectors/source-sendgrid/manifest.yaml)
+- [Sentry](https://github.com/airbytehq/airbyte/blob/master/airbyte-integrations/connectors/source-sentry/manifest.yaml)
 
 ## Reference
 

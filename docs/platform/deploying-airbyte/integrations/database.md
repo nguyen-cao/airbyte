@@ -1,5 +1,5 @@
 ---
-products: oss-community, oss-enterprise
+products: oss-community
 ---
 
 # External Database
@@ -7,6 +7,10 @@ products: oss-community, oss-enterprise
 For production deployments, we recommend using a dedicated database instance for better reliability, and backups (such as AWS RDS or GCP Cloud SQL) instead of the default internal Postgres database (`airbyte/db`) that Airbyte spins up within the Kubernetes cluster.
 
 The following instructions assume that you've already configured a Postgres instance:
+
+## Supported Postgres versions
+
+Airbyte requires Postgres 13 or later. Airbyte tests its deployments through Postgres 17. Newer versions may work, but Airbyte doesn't test them.
 
 ## Secrets
 
@@ -26,7 +30,7 @@ stringData:
 
 Add external database details to your `values.yaml` file. This disables the default internal Postgres database (`airbyte/db`), and configures your external Postgres database. You can override all of the values below by setting them in the airbyte-config-secrets or set them directly in the `values.yaml` file. **The database password is a special case in that it must be set in the [airbyte-config-secrets](#secrets).**
 
-```yaml
+```yaml title="values.yaml"
 postgresql:
   enabled: false
 
@@ -44,7 +48,7 @@ global:
     port: ""
 
     # -- The database name
-    database: ""
+    name: ""
 
     # -- The key within `secretName` where database user is stored
     userSecretKey: "" # e.g. "database-user"

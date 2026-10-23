@@ -1,40 +1,47 @@
 /*
- * Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.source.mongodb.cdc;
 
 import static io.airbyte.integrations.source.mongodb.cdc.MongoDbDebeziumConstants.OffsetState.KEY_SERVER_ID;
-import static io.airbyte.integrations.source.mongodb.cdc.MongoDbDebeziumPropertiesManager.DATABASE_INCLUDE_LIST_KEY;
-import static io.airbyte.integrations.source.mongodb.cdc.MongoDbDebeziumPropertiesManager.normalizeName;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mongodb.MongoChangeStreamException;
 import com.mongodb.MongoCommandException;
 import com.mongodb.client.ChangeStreamIterable;
 import com.mongodb.client.MongoClient;
-import com.mongodb.client.model.Aggregates;
-import com.mongodb.client.model.Filters;
 import io.airbyte.cdk.integrations.debezium.internals.AirbyteFileOffsetBackingStore;
 import io.airbyte.cdk.integrations.debezium.internals.DebeziumPropertiesManager;
 import io.airbyte.cdk.integrations.debezium.internals.DebeziumStateUtil;
 import io.airbyte.commons.json.Jsons;
 import io.airbyte.protocol.models.v0.ConfiguredAirbyteCatalog;
-import io.airbyte.protocol.models.v0.ConfiguredAirbyteStream;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.OffsetReader;
 import io.debezium.connector.mongodb.MongoDbConnectorConfig;
 import io.debezium.connector.mongodb.MongoDbOffsetContext;
 import io.debezium.connector.mongodb.MongoDbPartition;
+import io.debezium.connector.mongodb.MongoDbTaskContext;
+import io.debezium.connector.mongodb.MongoUtils;
 import io.debezium.connector.mongodb.ResumeTokens;
 import io.debezium.pipeline.spi.Partition;
-import java.util.*;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import org.apache.kafka.connect.runtime.WorkerConfig;
 import org.apache.kafka.connect.storage.FileOffsetBackingStore;
 import org.apache.kafka.connect.storage.OffsetStorageReaderImpl;
 import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.BsonTimestamp;
-import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -65,64 +72,55 @@ public class MongoDbDebeziumStateUtil implements DebeziumStateUtil {
    * Formats the Debezium initial state into a format suitable for storage in the offset data file.
    *
    * @param serverId The ID target MongoDB database.
-   * @param resumeTokenData The MongoDB resume token that represents the offset state.
+   * @param resumeTokenData The MongoDB resume token that represents the offset state, either as its
+   *        hex {@code _data} string or in the base64 form emitted by Debezium 3.x.
    * @return The offset state as a {@link JsonNode}.
    */
   public static JsonNode formatState(final String serverId, final String resumeTokenData) {
-    final BsonTimestamp timestamp = ResumeTokens.getTimestamp(ResumeTokens.fromData(resumeTokenData));
+    final BsonDocument resumeToken = MongoDbResumeTokenHelper.resumeTokenFromOffsetValue(resumeTokenData);
+    final BsonTimestamp timestamp = ResumeTokens.getTimestamp(resumeToken);
 
     final List<Object> key = generateOffsetKey(serverId);
 
     final Map<String, Object> value = new LinkedHashMap<>();
     value.put(MongoDbDebeziumConstants.OffsetState.VALUE_SECONDS, timestamp.getTime());
     value.put(MongoDbDebeziumConstants.OffsetState.VALUE_INCREMENT, timestamp.getInc());
-    value.put(MongoDbDebeziumConstants.OffsetState.VALUE_RESUME_TOKEN, resumeTokenData);
+    value.put(MongoDbDebeziumConstants.OffsetState.VALUE_RESUME_TOKEN, MongoDbResumeTokenHelper.resumeTokenData(resumeToken));
 
     return Jsons.jsonNode(Map.of(Jsons.serialize(key), Jsons.serialize(value)));
   }
 
   /**
    * Tests whether the provided saved offset resume token is valid for resuming a MongoDB change event
-   * stream.
+   * stream. Uses the same pipeline as Debezium to ensure consistency between validation and actual
+   * CDC resumption.
    *
    * @param savedOffset The resume token from the saved offset.
    * @param mongoClient The MongoClient used to validate the saved offset.
-   * @param databaseNames The list of database names to check.
-   * @param streamsByDatabase The list of lists of ConfiguredAirbyteStream objects, grouped by
-   *        database.
+   * @param debeziumProperties The Debezium properties used to configure the change stream pipeline.
    * @return {@code true} if the saved offset value is valid; otherwise, {@code false} to indicate
    *         that an initial snapshot should be performed.
    */
   public boolean isValidResumeToken(final BsonDocument savedOffset,
                                     final MongoClient mongoClient,
-                                    final List<String> databaseNames,
-                                    final List<List<ConfiguredAirbyteStream>> streamsByDatabase) {
+                                    final Properties debeziumProperties) {
     if (Objects.isNull(savedOffset) || savedOffset.isEmpty()) {
       return true;
     }
 
-    // databaseNames and streamsByDatabase must be the same length
-    List<Bson> orFilters = new ArrayList<>();
-    for (int i = 0; i < databaseNames.size(); i++) {
-      String dbName = databaseNames.get(i);
-      List<ConfiguredAirbyteStream> streams = streamsByDatabase.get(i);
-      List<String> collectionNames = streams.stream()
-          .map(s -> s.getStream().getName())
-          .toList();
-      // Match documents where ns.db == dbName and ns.coll in collectionNames
-      orFilters.add(Filters.and(
-          Filters.eq("ns.db", dbName),
-          Filters.in("ns.coll", collectionNames)));
-    }
+    // Use Debezium's MongoDbTaskContext to create the same pipeline used for actual CDC resumption.
+    // This ensures validation uses identical pipeline configuration as the streaming phase,
+    // preventing false negatives caused by pipeline mismatch.
+    final Configuration config = Configuration.from(debeziumProperties);
+    final MongoDbTaskContext taskContext = new MongoDbTaskContext(config);
 
-    final List<Bson> pipeline = Collections.singletonList(Aggregates.match(Filters.or(orFilters)));
-    final ChangeStreamIterable<BsonDocument> eventStream = mongoClient.watch(pipeline, BsonDocument.class);
+    // Open change stream with Debezium's pipeline (same as used in MongoDbStreamingChangeEventSource)
+    final ChangeStreamIterable<BsonDocument> stream = MongoUtils.openChangeStream(mongoClient, taskContext);
+    stream.resumeAfter(savedOffset);
 
-    // Attempt to start the stream after the saved offset.
-    eventStream.resumeAfter(savedOffset);
-    try (final var ignored = eventStream.cursor()) {
-      LOGGER.info("Valid resume token '{}' present, corresponding to timestamp (seconds after epoch) : {}.  Incremental sync will be performed for "
-          + "up-to-date streams.",
+    try (final var ignored = stream.cursor()) {
+      LOGGER.info("Valid resume token '{}' present, corresponding to timestamp (seconds after epoch) : {}. "
+          + "Incremental sync will be performed for up-to-date streams.",
           ResumeTokens.getData(savedOffset).asString().getValue(), ResumeTokens.getTimestamp(savedOffset).getTime());
       return true;
     } catch (final MongoCommandException | MongoChangeStreamException e) {
@@ -158,17 +156,6 @@ public class MongoDbDebeziumStateUtil implements DebeziumStateUtil {
     safeProps.put("mongodb.password", "****");
     LOGGER.info("properties: " + safeProps);
     Optional<BsonDocument> offset = parseSavedOffset(debeziumProperties);
-    if (offset.isEmpty()) {
-      LOGGER
-          .info(
-              "This connector is using the old offset format where server_id is set to database name, migrating to the new offset format where save_id is now connection string.");
-      for (String databaseName : debeziumProperties.getProperty(DATABASE_INCLUDE_LIST_KEY).split(",")) {
-        debeziumProperties.setProperty("name", normalizeName(databaseName));
-        offset = parseSavedOffset(debeziumProperties);
-        if (!offset.isEmpty())
-          break;
-      }
-    }
     return offset;
   }
 
@@ -185,7 +172,7 @@ public class MongoDbDebeziumStateUtil implements DebeziumStateUtil {
     OffsetStorageReaderImpl offsetStorageReader = null;
 
     try {
-      fileOffsetBackingStore = getFileOffsetBackingStore(properties);
+      fileOffsetBackingStore = getFileOffsetBackingStore(withOffsetStoreDefaults(properties));
       offsetStorageReader = getOffsetStorageReader(fileOffsetBackingStore, properties);
 
       final Configuration config = Configuration.from(properties);
@@ -207,7 +194,7 @@ public class MongoDbDebeziumStateUtil implements DebeziumStateUtil {
 
       if (resumeTokenData != null) {
         LOGGER.info("Resume token is not null");
-        final BsonDocument resumeToken = ResumeTokens.fromData(resumeTokenData.toString());
+        final BsonDocument resumeToken = MongoDbResumeTokenHelper.resumeTokenFromOffsetValue(resumeTokenData.toString());
         return Optional.of(resumeToken);
       } else {
         return Optional.empty();
@@ -223,6 +210,50 @@ public class MongoDbDebeziumStateUtil implements DebeziumStateUtil {
     }
   }
 
+  /**
+   * Rewrites the resume token of a Debezium offset into the connector's persisted form. Debezium 3.x
+   * emits offsets whose resume token is a base64-encoded BSON document and whose timestamp fields are
+   * unset; persisting the hex {@code _data} form together with the token's timestamp keeps the saved
+   * state identical in shape to the state written and read by earlier connector versions.
+   *
+   * @param offset The Debezium offset as emitted by the engine.
+   * @return The offset with its resume token and timestamp fields normalized.
+   */
+  public static Map<String, String> normalizeOffset(final Map<String, String> offset) {
+    final Map<String, String> normalized = new LinkedHashMap<>();
+    offset.forEach((key, value) -> {
+      final JsonNode offsetValue = Jsons.deserialize(value);
+      final JsonNode resumeTokenValue = offsetValue.get(MongoDbDebeziumConstants.OffsetState.VALUE_RESUME_TOKEN);
+      if (offsetValue instanceof ObjectNode objectNode && resumeTokenValue != null && resumeTokenValue.isTextual()) {
+        final BsonDocument resumeToken = MongoDbResumeTokenHelper.resumeTokenFromOffsetValue(resumeTokenValue.asText());
+        final BsonTimestamp timestamp = ResumeTokens.getTimestamp(resumeToken);
+        objectNode.put(MongoDbDebeziumConstants.OffsetState.VALUE_SECONDS, timestamp.getTime());
+        objectNode.put(MongoDbDebeziumConstants.OffsetState.VALUE_INCREMENT, timestamp.getInc());
+        objectNode.put(MongoDbDebeziumConstants.OffsetState.VALUE_RESUME_TOKEN, MongoDbResumeTokenHelper.resumeTokenData(resumeToken));
+        normalized.put(key, Jsons.serialize(objectNode));
+      } else {
+        normalized.put(key, value);
+      }
+    });
+    return normalized;
+  }
+
+  /**
+   * Kafka Connect 4.x (pulled in by Debezium 3.x) no longer provides a default for
+   * {@code bootstrap.servers} and rejects a worker configuration without it, even though the
+   * file-based offset backing store never connects to Kafka. Supplies a placeholder so that the
+   * offset file can be read.
+   *
+   * @param properties The Debezium properties.
+   * @return A copy of the properties suitable for configuring the offset backing store.
+   */
+  private static Properties withOffsetStoreDefaults(final Properties properties) {
+    final Properties offsetStoreProperties = new Properties();
+    offsetStoreProperties.putAll(properties);
+    offsetStoreProperties.putIfAbsent(WorkerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+    return offsetStoreProperties;
+  }
+
   private static List<Object> generateOffsetKey(final String serverId) {
     /*
      * N.B. The order of the keys in the sourceInfoMap and key list matters! DO NOT CHANGE the order
@@ -231,7 +262,7 @@ public class MongoDbDebeziumStateUtil implements DebeziumStateUtil {
      * io.debezium.connector.mongodb.SourceInfo class for the ordering of keys in the list/map.
      */
     final Map<String, String> sourceInfoMap = new LinkedHashMap<>();
-    final String normalizedServerId = MongoDbDebeziumPropertiesManager.normalizeName(serverId);
+    final String normalizedServerId = MongoDbDebeziumPropertiesManager.normalizeToDebeziumFormat(serverId);
     sourceInfoMap.put(KEY_SERVER_ID, normalizedServerId);
 
     final List<Object> key = new LinkedList<>();

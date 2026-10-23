@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 package io.airbyte.cdk.integrations.debezium.internals
 
@@ -23,6 +23,7 @@ import java.util.function.Supplier
 import org.apache.kafka.connect.source.SourceRecord
 
 private val LOGGER = KotlinLogging.logger {}
+
 /**
  * The record iterator is the consumer (in the producer / consumer relationship with debezium)
  * responsible for 1. making sure every record produced by the record publisher is processed 2.
@@ -40,11 +41,12 @@ class DebeziumRecordIterator<T>(
     private val publisherStatusSupplier: Supplier<Boolean>,
     private val debeziumShutdownProcedure: DebeziumShutdownProcedure<ChangeEvent<String?, String?>>,
     private val firstRecordWaitTime: Duration,
-    private val config: JsonNode
+    private val config: JsonNode,
 ) : AbstractIterator<ChangeEventWithMetadata>(), AutoCloseableIterator<ChangeEventWithMetadata> {
     private val heartbeatEventSourceField: MutableMap<Class<out ChangeEvent<*, *>?>, Field?> =
         HashMap(1)
     private val subsequentRecordWaitTime: Duration = firstRecordWaitTime.dividedBy(2)
+
     init {
         LOGGER.info { "Starting CDC Process" }
     }
@@ -71,7 +73,7 @@ class DebeziumRecordIterator<T>(
     // The following logic incorporates heartbeat:
     // 1. Wait on queue either the configured time first or 1 min after a record received
     // 2. If nothing came out of queue finish sync
-    // 3. If received heartbeat: check if hearbeat_lsn reached target or hasn't changed in a while
+    // 3. If received heartbeat: check if heartbeat_lsn reached target or hasn't changed in a while
     // finish sync
     // 4. If change event lsn reached target finish sync
     // 5. Otherwise check message queue again
@@ -79,7 +81,6 @@ class DebeziumRecordIterator<T>(
         // keep trying until the publisher is closed or until the queue is empty. the latter case is
         // possible when the publisher has shutdown but the consumer has not yet processed all
         // messages it emitted.
-        val instantBeforeSync = Instant.now()
         while (!MoreBooleans.isTruthy(publisherStatusSupplier.get()) || !queue.isEmpty()) {
             val next: ChangeEvent<String?, String?>?
             val waitTime =
@@ -126,7 +127,7 @@ class DebeziumRecordIterator<T>(
                     requestClose(
                         "Closing the Debezium engine after no records received within ${waitTime.seconds} seconds timeout. Status: receivedFirstRecord=$receivedFirstRecord, " +
                             "hasSnapshotFinished=$hasSnapshotFinished, noRecordsAttempts=$maxInstanceOfNoRecordsFound",
-                        DebeziumCloseReason.TIMEOUT
+                        DebeziumCloseReason.TIMEOUT,
                     )
                 }
 
@@ -149,30 +150,27 @@ class DebeziumRecordIterator<T>(
 
                 val heartbeatPos = getHeartbeatPosition(next)
                 val isProgressing = heartbeatPos != lastHeartbeatPosition
-                val instantSyncTime: Duration = Duration.between(instantBeforeSync, Instant.now())
-                val debeziumWaitingTimeRemaining = waitTime.seconds - instantSyncTime.toSeconds()
                 LOGGER.info {
-                    "CDC events queue poll(): " +
+                    "CDC events queue poll(): returned a heartbeat event, " +
                         if (isProgressing) {
-                            "returned a heartbeat event, " + "progressing to $heartbeatPos."
+                            "progressing to $heartbeatPos."
                         } else {
-                            "no progress since last heartbeat. Will continue polling until timeout is reached. Time remaining in seconds: ${debeziumWaitingTimeRemaining}."
+                            "no progress since last heartbeat."
                         }
                 }
-                // wrap up sync if heartbeat position crossed the target OR heartbeat position
-                // hasn't changed for
-                // too long
+                // wrap up sync if heartbeat position crossed the target OR heartbeat's position
+                // hasn't changed for too long
                 if (targetPosition.reachedTargetPosition(heartbeatPos)) {
                     requestClose(
                         "Closing: Heartbeat indicates sync is done by reaching the target position",
-                        DebeziumCloseReason.HEARTBEAT_REACHED_TARGET_POSITION
+                        DebeziumCloseReason.HEARTBEAT_REACHED_TARGET_POSITION,
                     )
                 } else if (
                     heartbeatPos == this.lastHeartbeatPosition && heartbeatPosNotChanging()
                 ) {
                     requestClose(
                         "Closing: Heartbeat indicates sync is not progressing",
-                        DebeziumCloseReason.HEARTBEAT_NOT_PROGRESSING
+                        DebeziumCloseReason.HEARTBEAT_NOT_PROGRESSING,
                     )
                 }
 
@@ -205,7 +203,7 @@ class DebeziumRecordIterator<T>(
             if (targetPosition.reachedTargetPosition(changeEventWithMetadata)) {
                 requestClose(
                     "Closing: Change event reached target position",
-                    DebeziumCloseReason.CHANGE_EVENT_REACHED_TARGET_POSITION
+                    DebeziumCloseReason.CHANGE_EVENT_REACHED_TARGET_POSITION,
                 )
             }
             this.tsLastHeartbeat = null
@@ -228,7 +226,7 @@ class DebeziumRecordIterator<T>(
                 event =
                     debeziumShutdownProcedure.recordsRemainingAfterShutdown.poll(
                         100,
-                        TimeUnit.MILLISECONDS
+                        TimeUnit.MILLISECONDS,
                     )
             } catch (e: InterruptedException) {
                 throw RuntimeException(e)
@@ -287,7 +285,7 @@ class DebeziumRecordIterator<T>(
         }
         LOGGER.info { closeLogMessage }
         AirbyteTraceMessageUtility.emitAnalyticsTrace(
-            debeziumCloseReasonMessage(closeReason.toString())
+            debeziumCloseReasonMessage(closeReason.toString()),
         )
         debeziumShutdownProcedure.initiateShutdownProcedure()
         signalledDebeziumEngineShutdown = true
@@ -338,13 +336,14 @@ class DebeziumRecordIterator<T>(
         ITERATOR_CLOSE,
         HEARTBEAT_REACHED_TARGET_POSITION,
         CHANGE_EVENT_REACHED_TARGET_POSITION,
-        HEARTBEAT_NOT_PROGRESSING
+        HEARTBEAT_NOT_PROGRESSING,
     }
 
     companion object {
         val pollLogMaxTimeInterval: Duration = Duration.ofSeconds(5)
         const val POLL_LOG_MAX_CALLS_INTERVAL = 1_000
         private val unhandledFoundTypeList: MutableList<String> = mutableListOf()
+
         /**
          * We are not interested in message events. According to debezium
          * [documentation](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-create-events)
@@ -360,8 +359,7 @@ class DebeziumRecordIterator<T>(
                     LOGGER.debug { "event: $event" }
                 }
                 return handled
-            }
-                ?: return false
+            } ?: return false
         }
     }
 }

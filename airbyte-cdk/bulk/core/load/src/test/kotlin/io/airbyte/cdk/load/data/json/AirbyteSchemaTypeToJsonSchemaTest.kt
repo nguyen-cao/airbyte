@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.data.json
@@ -35,14 +35,14 @@ class AirbyteSchemaTypeToJsonSchemaTest {
                     "friends" to ArrayType(FieldType(StringType, true)),
                     "mixed_array" to
                         ArrayType(
-                            FieldType(UnionType.of(StringType, IntegerType), nullable = true)
+                            FieldType(UnionType.of(StringType, IntegerType), nullable = true),
                         ),
                     "address" to
                         ObjectType(
                             linkedMapOf(
                                 "street" to FieldType(StringType, true),
-                                "city" to FieldType(StringType, true)
-                            )
+                                "city" to FieldType(StringType, true),
+                            ),
                         ),
                     "combined_denormalized" to
                         ObjectType(linkedMapOf("name" to FieldType(StringType, true))),
@@ -52,10 +52,10 @@ class AirbyteSchemaTypeToJsonSchemaTest {
                     "time" to TimeTypeWithTimezone,
                     "time_without_timezone" to TimeTypeWithoutTimezone,
                     "timestamp" to TimestampTypeWithTimezone,
-                    "timestamp_without_timezone" to TimestampTypeWithoutTimezone
+                    "timestamp_without_timezone" to TimestampTypeWithoutTimezone,
                 )
                 .map { it.key to FieldType(it.value, nullable = true) }
-                .let { linkedMapOf(*it.toTypedArray()) }
+                .let { linkedMapOf(*it.toTypedArray()) },
         )
 
     // the json equivalent
@@ -107,7 +107,8 @@ class AirbyteSchemaTypeToJsonSchemaTest {
                 "city": {
                   "type": "string"
                 }
-              }
+              },
+              "additionalProperties": true
             },
             "combined_denormalized": {
               "type": "object",
@@ -115,7 +116,8 @@ class AirbyteSchemaTypeToJsonSchemaTest {
                 "name": {
                   "type": "string"
                 }
-              }
+              },
+              "additionalProperties": true
             },
             "union_array": {
               "type": "array",
@@ -154,14 +156,52 @@ class AirbyteSchemaTypeToJsonSchemaTest {
               "format": "date-time",
               "airbyte_type": "timestamp_without_timezone"
             }
-          }
+          },
+          "additionalProperties": true
         }
-    """.trimIndent()
+        """
+            .trimIndent()
 
     @Test
     fun testToJsonSchema() {
         val expected = json.deserializeToNode().serializeToString()
         val actual = AirbyteTypeToJsonSchema().convert(airbyteType).serializeToString()
         Assertions.assertEquals(expected, actual)
+    }
+
+    @Test
+    internal fun `test given additional properties when serialize then set additional properties`() {
+        val airbyteType = ObjectType(linkedMapOf<String, FieldType>(), true)
+        val node = AirbyteTypeToJsonSchema().convert(airbyteType)
+        Assertions.assertTrue(node.get("additionalProperties").asBoolean())
+    }
+
+    @Test
+    internal fun `test given additional properties is not defined when serialize then do not specify`() {
+        val airbyteType = ObjectType(linkedMapOf<String, FieldType>())
+        val node = AirbyteTypeToJsonSchema().convert(airbyteType)
+        Assertions.assertTrue(node.get("additionalProperties").booleanValue())
+    }
+
+    @Test
+    internal fun `test given required has elements when serialize then set required`() {
+        val required = listOf("requiredProperty")
+        val airbyteType =
+            ObjectType(properties = linkedMapOf<String, FieldType>(), required = required)
+
+        val node = AirbyteTypeToJsonSchema().convert(airbyteType)
+
+        Assertions.assertEquals(
+            required,
+            node.get("required").asIterable().map { it.asText() }.toList(),
+        )
+    }
+
+    @Test
+    internal fun `test given required is empty list when serialize then do not specify`() {
+        val airbyteType =
+            ObjectType(properties = linkedMapOf<String, FieldType>(), required = emptyList())
+        val node = AirbyteTypeToJsonSchema().convert(airbyteType)
+        Assertions.assertNull(node.get("required"))
     }
 }

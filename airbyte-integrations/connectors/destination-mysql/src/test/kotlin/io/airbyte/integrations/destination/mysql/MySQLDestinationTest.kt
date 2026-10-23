@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 package io.airbyte.integrations.destination.mysql
 
@@ -21,8 +21,8 @@ class MySQLDestinationTest {
                 JdbcUtils.USERNAME_KEY,
                 "user",
                 JdbcUtils.DATABASE_KEY,
-                "db"
-            )
+                "db",
+            ),
         )
     }
 
@@ -38,8 +38,8 @@ class MySQLDestinationTest {
                 JdbcUtils.DATABASE_KEY,
                 "db",
                 JdbcUtils.JDBC_URL_PARAMS_KEY,
-                extraParam
-            )
+                extraParam,
+            ),
         )
     }
 
@@ -55,8 +55,8 @@ class MySQLDestinationTest {
                 JdbcUtils.DATABASE_KEY,
                 "db",
                 JdbcUtils.SSL_KEY,
-                false
-            )
+                false,
+            ),
         )
     }
 

@@ -1,22 +1,21 @@
 # Copyright (c) 2023 Airbyte, Inc., all rights reserved.
+import json
 import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
-import pendulum
 from base_test import BaseTest
-from bingads.v13.reporting.reporting_service_manager import ReportingServiceManager
 from config_builder import ConfigBuilder
 from freezegun import freeze_time
-from source_bing_ads.source import SourceBingAds
+from protocol_helpers import read_helper
+from request_builder import RequestBuilder
 
-from airbyte_cdk.connector_builder.connector_builder_handler import resolve_manifest
 from airbyte_cdk.models import SyncMode
+from airbyte_cdk.test.catalog_builder import CatalogBuilder
+from airbyte_cdk.test.mock_http import HttpRequest, HttpResponse
+from airbyte_cdk.test.mock_http.response_builder import find_template
 
-
-SOURCE_BING_ADS = resolve_manifest(source=SourceBingAds(None, None, None)).record.data["manifest"]
-MANIFEST_STREAMS = [stream["name"] for stream in SOURCE_BING_ADS["streams"]]
 
 SECOND_READ_FREEZE_TIME = "2024-05-08"
 
@@ -25,22 +24,152 @@ class TestReportStream(BaseTest):
     start_date = "2024-01-01"
 
     @property
-    def service_manager(self) -> ReportingServiceManager:
-        return ReportingServiceManager
-
-    @property
     def _config(self) -> dict[str, Any]:
         return ConfigBuilder().with_reports_start_date(self.start_date).build()
 
     def _download_file(self, file: Optional[str] = None) -> Path:
         """
-        Returns path to temporary file of downloaded data that will be use in read.
-        Base file should be named as {file_name}.csv in resource/response folder.
+        Returns path to a temporary file of downloaded data that will be use in read.
+        Base file should be named as {file_name}.csv in the resource/response folder.
         """
         if file:
             path_to_tmp_file = Path(__file__).parent.parent / f"resource/response/{file}.csv"
             return path_to_tmp_file
         return Path(__file__).parent.parent / "resource/response/non-existing-file.csv"
+
+
+class TestReportDownloadErrorHandling(TestReportStream):
+    stream_name = "age_gender_audience_report_hourly"
+
+    _submit_request_body = {
+        "ReportRequest": {
+            "ExcludeColumnHeaders": False,
+            "ExcludeReportFooter": True,
+            "ExcludeReportHeader": True,
+            "Format": "Csv",
+            "FormatVersion": "2.0",
+            "ReportName": "AgeGenderAudienceReport",
+            "ReturnOnlyCompleteData": False,
+            "Type": "AgeGenderAudienceReportRequest",
+            "Aggregation": "Hourly",
+            "Columns": [
+                "AccountName",
+                "AccountNumber",
+                "AccountId",
+                "TimePeriod",
+                "CampaignName",
+                "CampaignId",
+                "AdGroupName",
+                "AdGroupId",
+                "AdDistribution",
+                "AgeGroup",
+                "Gender",
+                "Impressions",
+                "Clicks",
+                "Conversions",
+                "Spend",
+                "Revenue",
+                "ExtendedCost",
+                "Assists",
+                "Language",
+                "AccountStatus",
+                "CampaignStatus",
+                "AdGroupStatus",
+                "BaseCampaignId",
+                "AllConversions",
+                "AllRevenue",
+                "ViewThroughConversions",
+                "Goal",
+                "GoalType",
+                "AbsoluteTopImpressionRatePercent",
+                "TopImpressionRatePercent",
+                "ConversionsQualified",
+                "AllConversionsQualified",
+                "ViewThroughConversionsQualified",
+                "ViewThroughRevenue",
+            ],
+            "Scope": {"AccountIds": [180535609]},
+            "Time": {
+                "CustomDateRangeStart": {"Day": 1, "Month": 1, "Year": 2024},
+                "CustomDateRangeEnd": {"Day": 6, "Month": 5, "Year": 2024},
+                "ReportTimeZone": "GreenwichMeanTimeDublinEdinburghLisbonLondon",
+            },
+        }
+    }
+
+    _expired_sas_response_body = (
+        "<Error><Code>AuthenticationFailed</Code><Message>Server failed to authenticate the request.</Message>"
+        "<AuthenticationErrorDetail>Signature not valid in the specified time frame: Start [2024-01-01T00:00:00Z] "
+        "- Expiry [2024-01-01T00:10:00Z] - Current [2024-01-01T00:11:00Z]</AuthenticationErrorDetail></Error>"
+    )
+    _permission_mismatch_response_body = (
+        "<Error><Code>AuthorizationPermissionMismatch</Code><Message>This request is not authorized to perform this "
+        "operation using this permission.</Message></Error>"
+    )
+    _expired_sas_error_message = "Bing Ads file download URL is expired."
+    _default_forbidden_error_message = "Forbidden. You don't have permission to access this resource."
+
+    def _mock_report_apis(self, download_response: HttpResponse):
+        self.mock_user_query_api(response_template="user_query")
+        self.mock_accounts_search_api(
+            response_template="accounts_search_for_report",
+            body=b'{"PageInfo": {"Index": 0, "Size": 1000}, "Predicates": [{"Field": "UserId", "Operator": "Equals", "Value": "123456789"}], "ReturnAdditionalFields": "TaxCertificate,AccountMode"}',
+        )
+        self.http_mocker.post(
+            HttpRequest(
+                url="https://reporting.api.bingads.microsoft.com/Reporting/v13/GenerateReport/Submit",
+                body=json.dumps(self._submit_request_body),
+            ),
+            HttpResponse('{"ReportRequestId": "thisisthereport_requestid"}', 200),
+        )
+        poll_response = HttpResponse(
+            json.dumps(find_template("generate_report_poll", __file__)),
+            200,
+        )
+        self.http_mocker.post(
+            RequestBuilder(resource="GenerateReport/Poll", api="reporting")
+            .with_body('{"ReportRequestId": "thisisthereport_requestid"}')
+            .build(),
+            [poll_response, poll_response],
+        )
+        self.http_mocker.get(RequestBuilder(resource="").build_report_url(), download_response)
+
+    def _read_with_download_response(self, download_response: HttpResponse):
+        self._mock_report_apis(download_response)
+        catalog = CatalogBuilder().with_stream(self.stream_name, SyncMode.full_refresh).build()
+        return read_helper(self._config, catalog, expecting_exception=True)
+
+    def _assert_error(self, output, failure_type: str, message: str, message_contains: bool = False):
+        errors = [message.trace.error for message in output.errors]
+        assert any(
+            getattr(error.failure_type, "value", error.failure_type) == failure_type
+            and (message in error.message if message_contains else error.message == message)
+            for error in errors
+        ), [(error.failure_type, error.message) for error in errors]
+
+    @freeze_time("2024-05-06")
+    def test_expired_download_url_is_transient_error(self):
+        output = self._read_with_download_response(
+            HttpResponse(
+                self._expired_sas_response_body,
+                403,
+                headers={"x-ms-error-code": "AuthenticationFailed"},
+            )
+        )
+
+        self._assert_error(output, "transient_error", self._expired_sas_error_message)
+
+    @freeze_time("2024-05-06")
+    def test_other_download_forbidden_error_remains_config_error(self):
+        output = self._read_with_download_response(
+            HttpResponse(
+                self._permission_mismatch_response_body,
+                403,
+                headers={"x-ms-error-code": "AuthorizationPermissionMismatch"},
+            )
+        )
+
+        self._assert_error(output, "config_error", self._default_forbidden_error_message, message_contains=True)
 
 
 class TestSuiteReportStream(TestReportStream):
@@ -75,15 +204,14 @@ class TestSuiteReportStream(TestReportStream):
 
     @freeze_time("2024-05-06")
     def test_return_records_from_given_csv_file(self):
-        assert SOURCE_BING_ADS
         self.mock_report_apis()
-        output, _ = self.read_stream(self.stream_name, SyncMode.full_refresh, self._config, self.report_file)
+        output = self.read_stream(self.stream_name, SyncMode.full_refresh, self._config, self.report_file)
         assert len(output.records) == self.records_number
 
     @freeze_time("2024-05-06")
     def test_transform_records_from_given_csv_file(self):
         self.mock_report_apis()
-        output, _ = self.read_stream(self.stream_name, SyncMode.full_refresh, self._config, self.report_file)
+        output = self.read_stream(self.stream_name, SyncMode.full_refresh, self._config, self.report_file)
 
         assert len(output.records) == self.records_number
         for record in output.records:
@@ -92,7 +220,7 @@ class TestSuiteReportStream(TestReportStream):
     @freeze_time("2024-05-06")
     def test_incremental_read_returns_records(self):
         self.mock_report_apis()
-        output, _ = self.read_stream(self.stream_name, SyncMode.incremental, self._config, self.report_file)
+        output = self.read_stream(self.stream_name, SyncMode.incremental, self._config, self.report_file)
         assert len(output.records) == self.records_number
         assert output.most_recent_state.stream_state.__dict__ == self.first_read_state
 
@@ -101,59 +229,12 @@ class TestSuiteReportStream(TestReportStream):
         """
         We validate the state cursor is set to the value of the latest record read.
         """
-        if self.stream_name not in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping test_incremental_read_returns_records for NOT migrated to manifest stream: {self.stream_name}")
         if not self.report_file_with_records_further_start_date or not self.first_read_state_for_records_further_start_date:
             assert False, "test_incremental_read_returns_records_further_config_start_date is not correctly set"
         self.mock_report_apis()
-        output, _ = self.read_stream(self.stream_name, SyncMode.incremental, self._config, self.report_file_with_records_further_start_date)
+        output = self.read_stream(self.stream_name, SyncMode.incremental, self._config, self.report_file_with_records_further_start_date)
         assert len(output.records) == self.records_number
         assert output.most_recent_state.stream_state.__dict__ == self.first_read_state_for_records_further_start_date
-
-    @freeze_time("2024-05-06")
-    def test_incremental_read_with_state_returns_records(self):
-        if self.stream_name in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for migrated to manifest stream: : {self.stream_name}")
-        self.mock_report_apis()
-        state = self._state(self.state_file, self.stream_name)
-        output, service_call_mock = self.read_stream(
-            self.stream_name, SyncMode.incremental, self._config, self.incremental_report_file, state
-        )
-        if not self.second_read_records_number:
-            assert len(output.records) == self.records_number
-        else:
-            assert len(output.records) == self.second_read_records_number
-
-        most_recent_state = output.most_recent_state.stream_state.__dict__
-        actual_cursor = most_recent_state.get(self.account_id)
-        expected_cursor = self.second_read_state.get(self.account_id)
-        assert actual_cursor == expected_cursor
-
-        provided_state = state[0].stream.stream_state.__dict__[self.account_id][self.cursor_field]
-        # gets ReportDownloadParams object
-        request_start_date = service_call_mock.call_args.args[0].report_request.Time.CustomDateRangeStart
-        year = request_start_date.Year
-        month = request_start_date.Month
-        day = request_start_date.Day
-        assert pendulum.DateTime(year, month, day, tzinfo=pendulum.UTC) == pendulum.parse(provided_state)
-
-    def test_incremental_read_with_state_and_no_start_date_returns_records_once(self):
-        """
-        Test that incremental read with state and no start date in config returns records only once.
-        We observed that if the start date is not provided in the config, and we don't parse correctly the account_id
-        from the state, the incremental read returns records multiple times as we yield the default_time_periods
-        for no start date scenario.
-        """
-        if self.stream_name in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for migrated to manifest stream: : {self.stream_name}")
-        state = self._state(self.state_file, self.stream_name)
-        config = deepcopy(self._config)
-        del config["reports_start_date"]  # Simulate no start date in config
-        output, service_call_mock = self.read_stream(self.stream_name, SyncMode.incremental, config, self.incremental_report_file, state)
-        if not self.second_read_records_number:
-            assert len(output.records) == self.records_number
-        else:
-            assert len(output.records) == self.second_read_records_number
 
     @freeze_time(SECOND_READ_FREEZE_TIME)
     def test_incremental_read_with_state_and_no_start_date_returns_records_once_after_migration(self):
@@ -163,13 +244,11 @@ class TestSuiteReportStream(TestReportStream):
         from the state, the incremental read returns records multiple times as we yield the default_time_periods
         for no start date scenario.
         """
-        if self.stream_name not in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for NOT migrated to manifest stream: {self.stream_name}")
         self.mock_report_apis()
         state = self._state(self.state_file_legacy, self.stream_name)
         config = deepcopy(self._config)
         del config["reports_start_date"]  # Simulate no start date in config
-        output, service_call_mock = self.read_stream(
+        output = self.read_stream(
             self.stream_name, SyncMode.incremental, config, self.incremental_report_file_with_records_further_cursor, state
         )
         if not self.second_read_records_number:
@@ -182,13 +261,9 @@ class TestSuiteReportStream(TestReportStream):
         """
         For this test the records are all with TimePeriod behind the config start date and the state TimePeriod cursor.
         """
-        if self.stream_name not in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for NOT migrated to manifest stream: {self.stream_name}")
         self.mock_report_apis()
         state = self._state(self.state_file_after_migration, self.stream_name)
-        output, service_call_mock = self.read_stream(
-            self.stream_name, SyncMode.incremental, self._config, self.incremental_report_file, state
-        )
+        output = self.read_stream(self.stream_name, SyncMode.incremental, self._config, self.incremental_report_file, state)
         if not self.second_read_records_number:
             assert len(output.records) == self.records_number
         else:
@@ -216,11 +291,9 @@ class TestSuiteReportStream(TestReportStream):
         So we validate that the cursor in the output.most_recent_state is moved to the value of the latest record read.
         The state format before migration IS NOT involved in this test.
         """
-        if self.stream_name not in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for NOT migrated to manifest stream: : {self.stream_name}")
         self.mock_report_apis()
         provided_state = self._state(self.state_file_after_migration_with_cursor_further_config_start_date, self.stream_name)
-        output, service_call_mock = self.read_stream(
+        output = self.read_stream(
             self.stream_name, SyncMode.incremental, self._config, self.incremental_report_file_with_records_further_cursor, provided_state
         )
         if not self.second_read_records_number:
@@ -273,23 +346,24 @@ class TestSuiteReportStream(TestReportStream):
 
         last_successful_sync_cursor_value = provided_state[0].stream.stream_state.state[self.cursor_field]
         assert job_start_time == last_successful_sync_cursor_value
-        assert job_end_time == f"{SECOND_READ_FREEZE_TIME}T00:00:00+00:00"
+        if "hourly" in self.stream_name or (hasattr(self, "custom_report_aggregation") and self.custom_report_aggregation == "Hourly"):
+            assert job_end_time == f"{SECOND_READ_FREEZE_TIME}T00:00:00+00:00"
+        else:
+            assert job_end_time == SECOND_READ_FREEZE_TIME
 
     @freeze_time(SECOND_READ_FREEZE_TIME)
     def test_incremental_read_with_legacy_state_returns_records_after_migration_with_records_further_state_cursor(self):
         """
-        For this test we get records with TimePeriod further the config start date and the state TimePeriod cursor.
-        The provide state is taken from a previous run; with python stream; so, is already in legacy format, and
+        For this test, we get records with TimePeriod further the config start date and the state TimePeriod cursor.
+        The provided state is taken from a previous run; with python stream; so, is already in legacy format, and
         where the resultant cursor was further the config start date.
         So we validate that the cursor in the output.most_recent_state is moved to the value of the latest record read.
         Also, the state is migrated to the new format, so we can validate that the partition is correctly set.
         The state format before migration (legacy) IS involved in this test.
         """
-        if self.stream_name not in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for NOT migrated to manifest stream: {self.stream_name}")
         self.mock_report_apis()
         provided_state = self._state(self.state_file_legacy, self.stream_name)
-        output, service_call_mock = self.read_stream(
+        output = self.read_stream(
             self.stream_name, SyncMode.incremental, self._config, self.incremental_report_file_with_records_further_cursor, provided_state
         )
         if not self.second_read_records_number:
@@ -314,7 +388,7 @@ class TestSuiteReportStream(TestReportStream):
             assert False, f"Expected state is empty for account_id: {self.account_id}"
         if not actual_partition or not expected_partition:
             assert False, f"Expected state is empty for account_id: {self.account_id}"
-        # here the cursor moved to expected that is the latest record read
+        # here the cursor moved to expect that is the latest record read
         assert actual_cursor == expected_cursor
         assert actual_partition == expected_partition
 
@@ -341,7 +415,10 @@ class TestSuiteReportStream(TestReportStream):
 
         last_successful_sync_cursor_value = vars(provided_state[0].stream.stream_state)[self.account_id][self.cursor_field]
         assert job_start_time == last_successful_sync_cursor_value
-        assert job_end_time == f"{SECOND_READ_FREEZE_TIME}T00:00:00+00:00"
+        if "hourly" in self.stream_name or (hasattr(self, "custom_report_aggregation") and self.custom_report_aggregation == "Hourly"):
+            assert job_end_time == f"{SECOND_READ_FREEZE_TIME}T00:00:00+00:00"
+        else:
+            assert job_end_time == SECOND_READ_FREEZE_TIME
 
     @freeze_time("2024-05-06")
     def test_no_config_start_date(self):
@@ -349,8 +426,6 @@ class TestSuiteReportStream(TestReportStream):
         If the field reports_start_date is blank, Airbyte will replicate all data from previous and current calendar years.
         This test is to validate that the stream will return all records from the first day of the year 2023 (CustomDateRangeStart in mocked body).
         """
-        if self.stream_name not in MANIFEST_STREAMS:
-            self.skipTest(f"Skipping for NOT migrated to manifest stream: {self.stream_name}")
         self.mock_report_apis()
         # here we mock the report start date to be the first day of the year 2023
         self.mock_generate_report_api(
@@ -360,11 +435,14 @@ class TestSuiteReportStream(TestReportStream):
         )
         config = deepcopy(self._config)
         del config["reports_start_date"]
-        output, _ = self.read_stream(self.stream_name, SyncMode.incremental, config, self.report_file)
+        output = self.read_stream(self.stream_name, SyncMode.incremental, config, self.report_file)
         assert len(output.records) == self.records_number
         first_read_state = deepcopy(self.first_read_state)
         # this corresponds to the last read record as we don't have started_date in the config
-        # the self.first_read_state is set using the config start date so it is not correct for this test
-        first_read_state["state"][self.cursor_field] = "2023-11-12T00:00:00+00:00"
-        first_read_state["states"][0]["cursor"][self.cursor_field] = "2023-11-12T00:00:00+00:00"
-        assert output.most_recent_state.stream_state.__dict__ == first_read_state
+        # the self.first_read_state is set using the config start date, so it is not correct for this test
+        if "hourly" in self.stream_name or (hasattr(self, "custom_report_aggregation") and self.custom_report_aggregation == "Hourly"):
+            first_read_state["state"][self.cursor_field] = "2023-11-12T00:00:00+00:00"
+            first_read_state["states"][0]["cursor"][self.cursor_field] = "2023-11-12T00:00:00+00:00"
+            assert output.most_recent_state.stream_state.__dict__ == first_read_state
+        else:
+            assert output.most_recent_state.stream_state.__dict__ == first_read_state

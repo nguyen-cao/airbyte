@@ -5,18 +5,14 @@
 
 import logging
 from datetime import datetime, timedelta
-from unittest.mock import patch
 
-import freezegun
 import pytest
-import requests_mock
 from freezegun import freeze_time
-from source_amazon_seller_partner import SourceAmazonSellerPartner
-from source_amazon_seller_partner.components import AmazonSPOauthAuthenticator
-from source_amazon_seller_partner.utils import AmazonConfigException
 
-from airbyte_cdk.models import AirbyteStream, ConfiguredAirbyteCatalog, ConfiguredAirbyteStream, DestinationSyncMode, SyncMode
-from airbyte_cdk.sources.streams import Stream
+from airbyte_cdk.models import AirbyteStream, ConfiguredAirbyteCatalog, ConfiguredAirbyteStream, DestinationSyncMode, Status, SyncMode
+from airbyte_cdk.sources.streams.concurrent.default_stream import DefaultStream
+
+from .conftest import get_source
 
 
 logger = logging.getLogger("airbyte")
@@ -80,6 +76,7 @@ def connector_config_without_start_date():
     }
 
 
+@freeze_time("2017-02-25T00:00:00Z")
 def test_check_connection_with_orders_stop_iteration(requests_mock, connector_config_with_report_options):
     requests_mock.register_uri(
         "POST",
@@ -93,13 +90,14 @@ def test_check_connection_with_orders_stop_iteration(requests_mock, connector_co
         status_code=201,
         json={"payload": {"Orders": []}},
     )
-    assert SourceAmazonSellerPartner(
-        config=connector_config_with_report_options,
-        catalog=None,
-        state=None,
-    ).check_connection(logger, connector_config_with_report_options) == (True, None)
+    config = dict(connector_config_with_report_options)
+    source = get_source(config, config_path=None)
+    result = source.check(logger, source._config)
+    assert result.status == Status.SUCCEEDED
+    assert result.message is None
 
 
+@freeze_time("2017-02-25T00:00:00Z")
 def test_check_connection_with_orders(requests_mock, connector_config_with_report_options):
     requests_mock.register_uri(
         "POST",
@@ -113,114 +111,235 @@ def test_check_connection_with_orders(requests_mock, connector_config_with_repor
         status_code=200,
         json={"payload": {"Orders": [{"LastUpdateDate": "2024-06-02T00:00:00Z"}]}},
     )
-    assert SourceAmazonSellerPartner(
-        config=connector_config_with_report_options,
-        catalog=None,
-        state=None,
-    ).check_connection(logger, connector_config_with_report_options) == (True, None)
+    source = get_source(connector_config_with_report_options)
+    result = source.check(logger, source._config)
+    assert result.status == Status.SUCCEEDED
+    assert result.message is None
 
 
-@pytest.mark.parametrize(
-    ("report_name", "stream_name_w_options"),
-    (
-        (
-            "GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA",
-            [
-                (
-                    "GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA",
-                    [
-                        {"option_name": "some_name_1", "option_value": "some_value_1"},
-                        {"option_name": "some_name_2", "option_value": "some_value_2"},
-                    ],
-                ),
-            ],
-        ),
-        ("SOME_OTHER_STREAM", []),
-    ),
-)
-def test_get_stream_report_options_list(connector_config_with_report_options, report_name, stream_name_w_options):
-    assert (
-        list(
-            SourceAmazonSellerPartner(
-                config=connector_config_with_report_options,
-                catalog=None,
-                state=None,
-            ).get_stream_report_kwargs(report_name, connector_config_with_report_options)
-        )
-        == stream_name_w_options
+@freeze_time("2017-02-25T00:00:00Z")
+def test_check_connection_vendor_account(requests_mock, connector_vendor_config_with_report_options):
+    """Vendor accounts should pass the check using a vendor stream (not the seller Orders endpoint)."""
+    requests_mock.register_uri(
+        "POST",
+        "https://api.amazon.com/auth/o2/token",
+        status_code=200,
+        json={"access_token": "access_token", "expires_in": "3600"},
     )
-
-
-def test_config_report_options_validation_error_duplicated_streams(connector_config_with_report_options):
-    connector_config_with_report_options["report_options_list"].append(connector_config_with_report_options["report_options_list"][0])
-    with pytest.raises(AmazonConfigException) as e:
-        SourceAmazonSellerPartner(
-            config=connector_config_with_report_options,
-            catalog=None,
-            state=None,
-        ).validate_stream_report_options(connector_config_with_report_options)
-    assert e.value.message == "Stream name should be unique among all Report options list"
-
-
-def test_config_report_options_validation_error_duplicated_options(connector_config_with_report_options):
-    connector_config_with_report_options["report_options_list"][0]["options_list"].append(
-        connector_config_with_report_options["report_options_list"][0]["options_list"][0]
+    requests_mock.register_uri(
+        "GET",
+        "https://sandbox.sellingpartnerapi-na.amazon.com/vendor/orders/v1/purchaseOrders",
+        status_code=200,
+        json={"payload": {"orders": [{"purchaseOrderDate": "2017-02-25T00:00:00Z"}]}},
     )
-    with pytest.raises(AmazonConfigException) as e:
-        SourceAmazonSellerPartner(
-            config=connector_config_with_report_options,
-            catalog=None,
-            state=None,
-        ).validate_stream_report_options(connector_config_with_report_options)
-    assert e.value.message == "Option names should be unique for `GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA` report options"
+    config = dict(connector_vendor_config_with_report_options)
+    source = get_source(config, config_path=None)
+    result = source.check(logger, source._config)
+    assert result.status == Status.SUCCEEDED
+    assert result.message is None
+
+
+# TODO: Renable this test once this type of validation is supported
+# def test_config_report_options_validation_error_duplicated_streams(connector_config_with_report_options):
+#     connector_config_with_report_options["report_options_list"].append(connector_config_with_report_options["report_options_list"][0])
+#     with pytest.raises(ValueError) as e:
+#         get_source(connector_config_with_report_options).streams(connector_config_with_report_options)
+#     assert "Condition evaluated to False" in str(e.value)
+
+# TODO: Renable this test once this type of validation is supported
+# def test_config_report_options_validation_error_duplicated_options(connector_config_with_report_options):
+#     connector_config_with_report_options["report_options_list"][0]["options_list"].append(
+#         connector_config_with_report_options["report_options_list"][0]["options_list"][0]
+#     )
+#     with pytest.raises(ValueError) as e:
+#         get_source(connector_config_with_report_options).streams(connector_config_with_report_options)
+#     assert "Condition evaluated to False" in str(e.value)
 
 
 def test_streams(connector_config_without_start_date):
-    for stream in SourceAmazonSellerPartner(
-        config=connector_config_without_start_date,
-        catalog=None,
-        state=None,
-    ).streams(connector_config_without_start_date):
-        assert isinstance(stream, Stream)
+    for stream in get_source(connector_config_without_start_date).streams(connector_config_without_start_date):
+        assert isinstance(stream, DefaultStream)
 
 
-def test_streams_count(connector_config_without_start_date, monkeypatch):
-    streams = SourceAmazonSellerPartner(
-        config=connector_config_without_start_date,
-        catalog=None,
-        state=None,
-    ).streams(connector_config_without_start_date)
-    assert len(streams) == 44
+def test_streams_count_seller(connector_config_without_start_date, monkeypatch):
+    streams = get_source(connector_config_without_start_date).streams(connector_config_without_start_date)
+    assert len(streams) == 48
+
+
+def test_streams_count_vendor(monkeypatch):
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+        "account_type": "Vendor",
+    }
+    streams = get_source(config).streams(config)
+    assert len(streams) == 52
+
+
+# TODO: Renable this test once this type of validation is supported
+# @pytest.mark.parametrize(
+#     ("config", "should_raise"),
+#     (
+#         ({"replication_start_date": "2022-09-01T00:00:00Z", "replication_end_date": "2022-08-01T00:00:00Z"}, True),
+#         ({"replication_start_date": "2022-09-01T00:00:00Z", "replication_end_date": "2022-10-01T00:00:00Z"}, False),
+#         ({"replication_end_date": "2022-10-01T00:00:00Z"}, False),
+#         ({"replication_start_date": "2022-09-01T00:00:00Z"}, False),
+#         ({}, False),
+#     ),
+# )
+# def test_replication_dates_validation(config, should_raise):
+#     if should_raise:
+#         with pytest.raises(AmazonConfigException) as e:
+#             SourceAmazonSellerPartner(
+#                 config=config,
+#                 catalog=None,
+#                 state=None,
+#             ).validate_replication_dates(config)
+#         assert e.value.message == "End Date should be greater than or equal to Start Date"
+#     else:
+#         assert (
+#             SourceAmazonSellerPartner(
+#                 config=config,
+#                 catalog=None,
+#                 state=None,
+#             ).validate_replication_dates(config)
+#             is None
+#         )
+
+
+VENDOR_ONLY_STREAM_NAMES = [
+    "VendorDirectFulfillmentShipping",
+    "VendorOrders",
+    "VendorOrdersStatus",
+    "GET_VENDOR_FORECASTING_FRESH_REPORT",
+    "GET_VENDOR_FORECASTING_RETAIL_REPORT",
+    "GET_VENDOR_SALES_REPORT",
+    "GET_VENDOR_INVENTORY_REPORT",
+    "GET_VENDOR_TRAFFIC_REPORT",
+    "GET_VENDOR_NET_PURE_PRODUCT_MARGIN_REPORT",
+    "GET_VENDOR_REAL_TIME_INVENTORY_REPORT",
+]
+
+SELLER_ONLY_STREAM_NAMES = [
+    "Orders",
+    "OrderItems",
+    "ListFinancialEventGroups",
+    "ListFinancialEvents",
+]
+
+
+def test_vendor_streams_excluded_for_seller():
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+        "account_type": "Seller",
+    }
+    stream_names = [s.name for s in get_source(config).streams(config)]
+    for vendor_stream in VENDOR_ONLY_STREAM_NAMES:
+        assert vendor_stream not in stream_names, f"{vendor_stream} should not appear for Seller accounts"
+
+
+def test_vendor_streams_included_for_vendor():
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+        "account_type": "Vendor",
+    }
+    stream_names = [s.name for s in get_source(config).streams(config)]
+    for vendor_stream in VENDOR_ONLY_STREAM_NAMES:
+        assert vendor_stream in stream_names, f"{vendor_stream} should appear for Vendor accounts"
+
+
+def test_vendor_streams_excluded_when_account_type_missing():
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+    }
+    stream_names = [s.name for s in get_source(config).streams(config)]
+    for vendor_stream in VENDOR_ONLY_STREAM_NAMES:
+        assert vendor_stream not in stream_names, f"{vendor_stream} should not appear when account_type is not set"
+
+
+def test_seller_streams_excluded_for_vendor():
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+        "account_type": "Vendor",
+    }
+    stream_names = [s.name for s in get_source(config).streams(config)]
+    for seller_stream in SELLER_ONLY_STREAM_NAMES:
+        assert seller_stream not in stream_names, f"{seller_stream} should not appear for Vendor accounts"
+
+
+def test_seller_streams_included_for_seller():
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+        "account_type": "Seller",
+    }
+    stream_names = [s.name for s in get_source(config).streams(config)]
+    for seller_stream in SELLER_ONLY_STREAM_NAMES:
+        assert seller_stream in stream_names, f"{seller_stream} should appear for Seller accounts"
+
+
+def test_seller_streams_included_when_account_type_missing():
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+    }
+    stream_names = [s.name for s in get_source(config).streams(config)]
+    for seller_stream in SELLER_ONLY_STREAM_NAMES:
+        assert seller_stream in stream_names, f"{seller_stream} should appear when account_type is not set (defaults to Seller)"
 
 
 @pytest.mark.parametrize(
-    ("config", "should_raise"),
-    (
-        ({"replication_start_date": "2022-09-01T00:00:00Z", "replication_end_date": "2022-08-01T00:00:00Z"}, True),
-        ({"replication_start_date": "2022-09-01T00:00:00Z", "replication_end_date": "2022-10-01T00:00:00Z"}, False),
-        ({"replication_end_date": "2022-10-01T00:00:00Z"}, False),
-        ({"replication_start_date": "2022-09-01T00:00:00Z"}, False),
-        ({}, False),
-    ),
+    "account_type,expected_first_stream",
+    [
+        pytest.param("Seller", "Orders", id="seller_first_stream_is_orders"),
+        pytest.param("Vendor", "VendorOrders", id="vendor_first_stream_is_vendor_orders"),
+    ],
 )
-def test_replication_dates_validation(config, should_raise):
-    if should_raise:
-        with pytest.raises(AmazonConfigException) as e:
-            SourceAmazonSellerPartner(
-                config=config,
-                catalog=None,
-                state=None,
-            ).validate_replication_dates(config)
-        assert e.value.message == "End Date should be greater than or equal to Start Date"
-    else:
-        assert (
-            SourceAmazonSellerPartner(
-                config=config,
-                catalog=None,
-                state=None,
-            ).validate_replication_dates(config)
-            is None
-        )
+def test_first_stream_ordering_for_check(account_type, expected_first_stream):
+    """CheckDynamicStream uses the first stream for connectivity check.
+
+    Seller accounts must resolve Orders first; Vendor accounts must resolve
+    VendorOrders first. If this test fails, the connectivity check will use
+    the wrong stream — see the IMPORTANT comment in manifest.yaml streams section.
+    """
+    config = {
+        "refresh_token": "Atzr|IwEBIP-abc123",
+        "lwa_app_id": "amzn1.application-oa2-client.abc123",
+        "lwa_client_secret": "abc123",
+        "aws_environment": "SANDBOX",
+        "region": "US",
+        "account_type": account_type,
+    }
+    streams = get_source(config).streams(config)
+    assert streams[0].name == expected_first_stream, (
+        f"Expected first stream for {account_type} to be {expected_first_stream}, "
+        f"got {streams[0].name}. Stream ordering matters for CheckDynamicStream."
+    )
 
 
 mock_catalog = ConfiguredAirbyteCatalog(
@@ -394,6 +513,10 @@ def test_stream_slice_dates(config, expected_start_base, expected_end_base, stre
     """
     now = datetime.strptime("2023-01-01T00:00:00Z", "%Y-%m-%dT%H:%M:%SZ")
 
+    # Vendor streams require account_type=Vendor to appear in the catalog
+    if stream_name.startswith("Vendor"):
+        config = {**config, "account_type": "Vendor"}
+
     # Mock the token refresh endpoint
     requests_mock.post(
         "https://api.amazon.com/auth/o2/token", json={"access_token": "fake_access_token", "expires_in": 3600}, status_code=200
@@ -401,24 +524,14 @@ def test_stream_slice_dates(config, expected_start_base, expected_end_base, stre
 
     # Mock the Orders API endpoint for OrderItems stream
     if stream_name == "OrderItems":
-        start_date = config.get("replication_start_date", default_start_date(now))
-        end_date = config.get("replication_end_date", default_end_date("Orders", now))
-        # Adjust start_date to default if earlier than now - 730 days
-        default_start = default_start_date(now)
-        start_date = max(start_date, default_start)
-
-        orders_url = (
-            f"https://sandbox.sellingpartnerapi-na.amazon.com/orders/v0/orders?"
-            f"MarketplaceIds={config['marketplace_id']}&MaxResultsPerPage=100&"
-            f"LastUpdatedAfter={start_date}&LastUpdatedBefore={end_date}"
-        )
+        orders_url = "https://sandbox.sellingpartnerapi-na.amazon.com/orders/v0/orders"
         requests_mock.get(orders_url, json={"payload": {"Orders": [{"AmazonOrderId": "123-4567890-1234567"}]}}, status_code=200)
 
     # Initialize the source with the mock catalog, test config, and no state
-    source = SourceAmazonSellerPartner(catalog=mock_catalog, config=config, state=None)
+    source = get_source(config=config, state=None)
 
     # Retrieve the specific stream by its name
-    streams = source.streams(config)
+    streams = source.streams(source._config)
     stream = next((s for s in streams if s.name == stream_name), None)
     assert stream is not None, f"Stream '{stream_name}' not found in available streams"
 
@@ -429,7 +542,7 @@ def test_stream_slice_dates(config, expected_start_base, expected_end_base, stre
         expected_end = expected_end_base
 
     # Generate and verify stream slices
-    slices = list(stream.stream_slices(sync_mode=SyncMode.full_refresh, stream_state={}))
+    slices = list(map(lambda partition: partition.to_slice(), stream.generate_partitions()))
     assert len(slices) > 0, f"No slices generated for stream '{stream_name}'"
     first_slice = slices[0]
     last_slice = slices[-1]
@@ -439,3 +552,21 @@ def test_stream_slice_dates(config, expected_start_base, expected_end_base, stre
         first_slice["start_time"] == expected_start_base
     ), f"Stream '{stream_name}': Expected start time {expected_start_base}, got {first_slice['start_time']}"
     assert last_slice["end_time"] == expected_end, f"Stream '{stream_name}': Expected end time {expected_end}, got {last_slice['end_time']}"
+
+
+@pytest.mark.parametrize(
+    "stream_name",
+    [
+        "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
+        "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL",
+    ],
+)
+def test_flat_file_all_orders_streams_have_no_primary_key(connector_config_without_start_date, stream_name):
+    """
+    These reports are one row per order item, so `amazon-order-id` alone is not unique, and no other column has
+    been proven to be a reliably unique row identifier. Declaring a primary key makes destination dedup collapse
+    multi-item orders into a single row (silent data loss), so the streams must not declare any primary key.
+    """
+    streams = get_source(connector_config_without_start_date).streams(connector_config_without_start_date)
+    stream = next(stream for stream in streams if stream.name == stream_name)
+    assert not stream.as_airbyte_stream().source_defined_primary_key

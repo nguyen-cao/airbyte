@@ -1,15 +1,16 @@
-/* Copyright (c) 2024 Airbyte, Inc., all rights reserved. */
+/* Copyright (c) 2026 Airbyte, Inc., all rights reserved. */
 package io.airbyte.integrations.source.mysql
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.mysql.cj.MysqlType
 import io.airbyte.cdk.command.OpaqueStateValue
+import io.airbyte.cdk.data.JsonEncoder
 import io.airbyte.cdk.discover.CdcIntegerMetaFieldType
 import io.airbyte.cdk.discover.CdcOffsetDateTimeMetaFieldType
 import io.airbyte.cdk.discover.CdcStringMetaFieldType
 import io.airbyte.cdk.discover.CommonMetaField
-import io.airbyte.cdk.discover.Field
+import io.airbyte.cdk.discover.DataField
 import io.airbyte.cdk.discover.FieldType
 import io.airbyte.cdk.discover.JdbcAirbyteStreamFactory
 import io.airbyte.cdk.discover.JdbcMetadataQuerier
@@ -34,6 +35,8 @@ import io.airbyte.cdk.jdbc.OffsetDateTimeFieldType
 import io.airbyte.cdk.jdbc.PokemonFieldType
 import io.airbyte.cdk.jdbc.ShortFieldType
 import io.airbyte.cdk.jdbc.StringFieldType
+import io.airbyte.cdk.output.sockets.FieldValueEncoder
+import io.airbyte.cdk.output.sockets.NativeRecordPayload
 import io.airbyte.cdk.read.And
 import io.airbyte.cdk.read.Equal
 import io.airbyte.cdk.read.From
@@ -82,14 +85,49 @@ class MySqlSourceOperations :
             CommonMetaField.CDC_UPDATED_AT,
             CommonMetaField.CDC_DELETED_AT,
             MySqlSourceCdcMetaFields.CDC_LOG_FILE,
-            MySqlSourceCdcMetaFields.CDC_LOG_POS
+            MySqlSourceCdcMetaFields.CDC_LOG_POS,
         )
+
+    @Suppress("UNCHECKED_CAST")
+    override fun decorateRecordData(
+        timestamp: OffsetDateTime,
+        globalStateValue: OpaqueStateValue?,
+        stream: Stream,
+        recordData: NativeRecordPayload,
+    ) {
+        recordData[CommonMetaField.CDC_UPDATED_AT.id] =
+            FieldValueEncoder(
+                timestamp,
+                CommonMetaField.CDC_UPDATED_AT.type.jsonEncoder as JsonEncoder<Any>,
+            )
+        recordData[MySqlSourceCdcMetaFields.CDC_LOG_POS.id] =
+            FieldValueEncoder(
+                0.toDouble(),
+                MySqlSourceCdcMetaFields.CDC_LOG_POS.type.jsonEncoder as JsonEncoder<Any>,
+            )
+        if (globalStateValue == null) {
+            return
+        }
+        val offset: DebeziumOffset =
+            MySqlSourceDebeziumOperations.deserializeStateUnvalidated(globalStateValue).offset
+        val position: MySqlSourceCdcPosition = MySqlSourceDebeziumOperations.position(offset)
+        recordData[MySqlSourceCdcMetaFields.CDC_LOG_FILE.id] =
+            FieldValueEncoder(
+                position.fileName,
+                MySqlSourceCdcMetaFields.CDC_LOG_FILE.type.jsonEncoder as JsonEncoder<Any>,
+            )
+        recordData[MySqlSourceCdcMetaFields.CDC_LOG_POS.id] =
+            FieldValueEncoder(
+                position.position.toDouble(),
+                MySqlSourceCdcMetaFields.CDC_LOG_POS.type.jsonEncoder as JsonEncoder<Any>,
+            )
+    }
 
     override fun decorateRecordData(
         timestamp: OffsetDateTime,
         globalStateValue: OpaqueStateValue?,
         stream: Stream,
-        recordData: ObjectNode
+        recordData: ObjectNode,
     ) {
         recordData.set<JsonNode>(
             CommonMetaField.CDC_UPDATED_AT.id,
@@ -137,11 +175,10 @@ class MySqlSourceOperations :
             MysqlType.BIGINT -> LongFieldType
             MysqlType.BIGINT_UNSIGNED -> BigIntegerFieldType
             MysqlType.FLOAT,
-            MysqlType.FLOAT_UNSIGNED,
-            MysqlType.DOUBLE,
-            MysqlType.DOUBLE_UNSIGNED -> {
+            MysqlType.FLOAT_UNSIGNED ->
                 if ((type.precision ?: 0) <= 23) FloatFieldType else DoubleFieldType
-            }
+            MysqlType.DOUBLE,
+            MysqlType.DOUBLE_UNSIGNED -> DoubleFieldType
             MysqlType.DECIMAL,
             MysqlType.DECIMAL_UNSIGNED -> {
                 if (type.scale == 0) BigIntegerFieldType else BigDecimalFieldType
@@ -195,7 +232,7 @@ class MySqlSourceOperations :
                 is SelectColumnMaxValue -> "MAX(${column.sql()})"
             }
 
-    fun Field.sql(): String = "`$id`"
+    fun DataField.sql(): String = "`$id`"
 
     fun FromNode.sql(): String =
         when (this) {

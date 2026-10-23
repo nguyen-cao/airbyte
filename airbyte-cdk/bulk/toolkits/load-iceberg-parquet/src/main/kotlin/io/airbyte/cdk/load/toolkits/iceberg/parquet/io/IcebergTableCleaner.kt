@@ -1,9 +1,10 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.toolkits.iceberg.parquet.io
 
+import io.airbyte.cdk.load.command.DestinationStream
 import jakarta.inject.Singleton
 import org.apache.iceberg.Table
 import org.apache.iceberg.catalog.Catalog
@@ -24,16 +25,16 @@ class IcebergTableCleaner(private val icebergUtil: IcebergUtil) {
      *
      * @param catalog The [Catalog] that is used to drop the [org.apache.iceberg.Table].
      * @param identifier The [TableIdentifier] that identifies the [org.apache.iceberg.Table] to be
-     * cleared.
+     *   cleared.
      * @param io The [FileIO] that may be used to delete the underlying data and metadata files.
      * @param tableLocation The storage location of files associated with the
-     * [org.apache.iceberg.Table].
+     *   [org.apache.iceberg.Table].
      */
     fun clearTable(
         catalog: Catalog,
         identifier: TableIdentifier,
         io: FileIO,
-        tableLocation: String
+        tableLocation: String,
     ) {
         catalog.dropTable(identifier, true)
         if (io is SupportsPrefixOperations) {
@@ -41,22 +42,25 @@ class IcebergTableCleaner(private val icebergUtil: IcebergUtil) {
         }
     }
 
-    fun deleteGenerationId(
+    fun deleteOldGenerationData(
         table: Table,
         stagingBranchName: String,
-        generationIdSuffix: List<String>
+        stream: DestinationStream,
     ) {
-        val genIdsToDelete =
-            generationIdSuffix
-                .filter {
-                    icebergUtil.assertGenerationIdSuffixIsOfValidFormat(it)
-                    true
-                }
-                .toSet()
+        val currentGenerationIdSuffix = icebergUtil.constructGenerationIdSuffix(stream)
 
         table.newScan().planFiles().use { tasks ->
             tasks
-                .filter { task -> genIdsToDelete.any { id -> task.file().location().contains(id) } }
+                .filter { task ->
+                    // Delete file if it doesn't contain the current generation ID prefix
+                    // This will also include any potential compaction file from previous generation
+                    // WARNING: This approach only works if users do not run compaction while the
+                    // truncate refresh sync is running. If compaction occurs during the sync, files
+                    // from the current generation may be renamed and lose their generation ID
+                    // suffix, causing them to be incorrectly deleted and resulting in data loss.
+                    // -------
+                    !task.file().location().contains(currentGenerationIdSuffix)
+                }
                 .forEach { task ->
                     table
                         .newDelete()

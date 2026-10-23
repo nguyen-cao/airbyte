@@ -10,14 +10,16 @@
 
 [tasks]
 
-get-connector-name = 'basename "$PWD"' # Use with -qq to get just the connector name
-fetch-secrets = "airbyte-cdk secrets fetch ${POE_PWD}"
+get-connector-name = "basename ${POE_PWD}" # Use with -qq to get just the connector name
+fetch-secrets = "airbyte-ops secrets fetch ${POE_PWD}"
 
 install = [
   "install-cdk-cli",
+  "install-ops-cli",
   "install-unit-tests-project",
 ]
 install-cdk-cli = "uv tool install --upgrade 'airbyte-cdk[dev]'"
+install-ops-cli = "uv tool install --upgrade airbyte-internal-ops"
 install-unit-tests-project.shell = '''
 if [ -f ${POE_PWD}/unit_tests/pyproject.toml ]; then
   echo "Found 'unit_tests/pyproject.toml' file, installing unit tests..."
@@ -45,6 +47,7 @@ fi
 '''
 test-integration-tests = "airbyte-cdk connector test ${POE_PWD}"
 format-check = "echo 'No format check step for this connector.'"
+lint-check = "echo 'No lint check step for this connector.'"
 
 lock.shell = '''
 set -eu # Ensure we return non-zero exit code upon failure
@@ -61,13 +64,15 @@ fi
 # Generic tasks (same across all connector types)
 
 [tasks.get-language]
-cmd = """yq eval '.data.tags[] | select(test("^language:")) | sub("language:","")' $PWD/metadata.yaml"""
+cmd = """yq eval '.data.tags[] | select(test("^language:")) | sub("language:","")' ${POE_PWD}/metadata.yaml"""
 help = "Get the language of the connector from its metadata.yaml file. Use with -qq to get just the language name."
 
 [tasks.get-base-image]
-cmd = """yq eval '.data.connectorBuildOptions.baseImage' $PWD/metadata.yaml"""
+cmd = """yq eval '.data.connectorBuildOptions.baseImage' ${POE_PWD}/metadata.yaml"""
 help = "Get the base image of the connector from its metadata.yaml file."
 
-[tasks.run-cat-tests]
-shell = "airbyte-ci connectors --name=`poe -qq get-connector-name` test --only-step=acceptance"
-help = "Run the legacy Airbyte-CI acceptance tests (CAT tests)."
+[tasks.get-version]
+cmd = """yq eval '.data.dockerImageTag' ${POE_PWD}/metadata.yaml"""
+help = "Get the version of the connector from its metadata.yaml file."
+
+# [tasks.run-cat-tests] - Removed: airbyte-ci CLI and CAT tests have been deprecated.

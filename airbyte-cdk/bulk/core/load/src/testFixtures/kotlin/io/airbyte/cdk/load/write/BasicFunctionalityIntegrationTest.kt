@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.write
@@ -10,12 +10,12 @@ import io.airbyte.cdk.load.command.Append
 import io.airbyte.cdk.load.command.Dedupe
 import io.airbyte.cdk.load.command.DestinationCatalog
 import io.airbyte.cdk.load.command.DestinationStream
+import io.airbyte.cdk.load.command.ImportType
 import io.airbyte.cdk.load.command.NamespaceMapper
 import io.airbyte.cdk.load.command.Property
 import io.airbyte.cdk.load.config.DataChannelFormat
 import io.airbyte.cdk.load.config.DataChannelMedium
 import io.airbyte.cdk.load.config.NamespaceDefinitionType
-import io.airbyte.cdk.load.config.NamespaceMappingConfig
 import io.airbyte.cdk.load.data.AirbyteType
 import io.airbyte.cdk.load.data.AirbyteValue
 import io.airbyte.cdk.load.data.ArrayType
@@ -25,7 +25,9 @@ import io.airbyte.cdk.load.data.DateType
 import io.airbyte.cdk.load.data.FieldType
 import io.airbyte.cdk.load.data.IntegerType
 import io.airbyte.cdk.load.data.IntegerValue
+import io.airbyte.cdk.load.data.NullValue
 import io.airbyte.cdk.load.data.NumberType
+import io.airbyte.cdk.load.data.NumberValue
 import io.airbyte.cdk.load.data.ObjectType
 import io.airbyte.cdk.load.data.ObjectTypeWithEmptySchema
 import io.airbyte.cdk.load.data.ObjectTypeWithoutSchema
@@ -40,11 +42,19 @@ import io.airbyte.cdk.load.data.TimestampWithTimezoneValue
 import io.airbyte.cdk.load.data.UnionType
 import io.airbyte.cdk.load.data.UnknownType
 import io.airbyte.cdk.load.data.json.toAirbyteValue
+import io.airbyte.cdk.load.dataflow.state.stats.StateAdditionalStatsStore
+import io.airbyte.cdk.load.message.CheckpointMessage
 import io.airbyte.cdk.load.message.InputGlobalCheckpoint
 import io.airbyte.cdk.load.message.InputRecord
 import io.airbyte.cdk.load.message.InputStreamCheckpoint
 import io.airbyte.cdk.load.message.Meta.Change
+import io.airbyte.cdk.load.message.Meta.Companion.CHECKPOINT_ID_NAME
+import io.airbyte.cdk.load.message.Meta.Companion.CHECKPOINT_INDEX_NAME
 import io.airbyte.cdk.load.message.StreamCheckpoint
+import io.airbyte.cdk.load.schema.model.ColumnSchema
+import io.airbyte.cdk.load.schema.model.StreamTableSchema
+import io.airbyte.cdk.load.schema.model.TableName
+import io.airbyte.cdk.load.schema.model.TableNames
 import io.airbyte.cdk.load.state.CheckpointId
 import io.airbyte.cdk.load.state.CheckpointIndex
 import io.airbyte.cdk.load.state.CheckpointKey
@@ -62,11 +72,14 @@ import io.airbyte.cdk.load.test.util.destination_process.DestinationUncleanExitE
 import io.airbyte.cdk.load.util.Jsons
 import io.airbyte.cdk.load.util.deserializeToNode
 import io.airbyte.cdk.load.util.serializeToString
+import io.airbyte.protocol.models.v0.AdditionalStats
 import io.airbyte.protocol.models.v0.AirbyteMessage
-import io.airbyte.protocol.models.v0.AirbyteRecordMessageFileReference
 import io.airbyte.protocol.models.v0.AirbyteRecordMessageMetaChange
+import io.airbyte.protocol.models.v0.AirbyteStateStats
+import io.airbyte.protocol.models.v0.StreamDescriptor
 import java.math.BigDecimal
 import java.math.BigInteger
+import java.math.RoundingMode
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -76,7 +89,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertDoesNotThrow
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Disabled
@@ -104,6 +116,25 @@ data class StronglyTyped(
     val integerCanBeLarge: Boolean = true,
     /** Whether the destination supports numbers larger than 1e39-1 */
     val numberCanBeLarge: Boolean = true,
+    /**
+     * Clearly redundant with other fields on this struct. We should do some sort of refactor here.
+     * Many warehouse destinations use a NUMERIC(38, 9) type for number columns. This flag enables a
+     * test case to validate some specific rounding/truncation behavior for fixed-point numbers.
+     */
+    val numberIsFixedPointPrecision38Scale9: Boolean = false,
+    /**
+     * No effect unless [numberIsFixedPointPrecision38Scale9] is set.
+     *
+     * If your connector relies on the warehouse to truncate/round off numbers with too many decimal
+     * places, and therefore does not populate an `airbyte_meta.changes` entry, you should enable
+     * this flag.
+     *
+     * This is not best practice, but is compatible with historical behavior, and we don't have a
+     * strong preference to enforce populating the `changes` list in this case.
+     */
+    val truncatedNumbersPopulateAirbyteMeta: Boolean = true,
+    /** No effect unless [numberIsFixedPointPrecision38Scale9] is set. */
+    val truncatedNumberRoundingMode: RoundingMode = RoundingMode.HALF_UP,
     /**
      * In some strongly-typed destinations, timetz columns are actually weakly typed. For example,
      * Bigquery writes timetz values into STRING columns, and doesn't actually validate that they
@@ -212,6 +243,20 @@ enum class UnknownTypesBehavior {
     FAIL,
 }
 
+enum class ColumnDropBehavior {
+    /**
+     * The destination drops columns that no longer exist in the new schema during schema evolution.
+     * This is the default behavior for most destinations.
+     */
+    DROP,
+
+    /**
+     * The destination retains columns that no longer exist in the new schema during schema
+     * evolution. The columns remain in the table but are no longer actively written to.
+     */
+    RETAIN,
+}
+
 data class DedupBehavior(
     val cdcDeletionMode: CdcDeletionMode = CdcDeletionMode.HARD_DELETE,
 ) {
@@ -269,21 +314,26 @@ abstract class BasicFunctionalityIntegrationTest(
     val isStreamSchemaRetroactiveForUnknownTypeToString: Boolean = true,
     val dedupBehavior: DedupBehavior?,
     val stringifySchemalessObjects: Boolean,
+    val stringifyUnionObjects: Boolean = false,
     val schematizedObjectBehavior: SchematizedNestedValueBehavior,
     val schematizedArrayBehavior: SchematizedNestedValueBehavior,
     val unionBehavior: UnionBehavior,
-    val preserveUndeclaredFields: Boolean,
-    val supportFileTransfer: Boolean,
+    val coercesLegacyUnions: Boolean = false,
     /**
      * Whether the destination commits new data when it receives a non-`COMPLETE` stream status. For
      * example:
      * * A destination which writes new data to a temporary directory, and moves those files to the
-     * "real" directory at the end of the sync if and only if it received a COMPLETE status, would
-     * set this parameter to `false`.
+     *   "real" directory at the end of the sync if and only if it received a COMPLETE status, would
+     *   set this parameter to `false`.
      * * A destination which writes new data directly into the real directory throughout the sync,
-     * would set this parameter to `true`.
+     *   would set this parameter to `true`.
      */
     val commitDataIncrementally: Boolean,
+    /**
+     * Some destination connectors commit data incrementally, but only when the stream is an append
+     * one. When the running a schema change, the behavior might be different than append.
+     */
+    val commitDataIncrementallyOnAppend: Boolean = commitDataIncrementally,
     /**
      * The same concept as [commitDataIncrementally], but specifically describes how the connector
      * behaves when the destination contains no data at the start of the sync. Some destinations
@@ -292,16 +342,29 @@ abstract class BasicFunctionalityIntegrationTest(
      *
      * (warehouse destinations with direct-load tables should set this to true).
      */
-    val commitDataIncrementallyToEmptyDestination: Boolean = commitDataIncrementally,
+    val commitDataIncrementallyToEmptyDestinationOnAppend: Boolean =
+        commitDataIncrementally || commitDataIncrementallyOnAppend,
+    val commitDataIncrementallyToEmptyDestinationOnDedupe: Boolean =
+        commitDataIncrementally || commitDataIncrementallyOnAppend,
     val allTypesBehavior: AllTypesBehavior,
     val unknownTypesBehavior: UnknownTypesBehavior = UnknownTypesBehavior.PASS_THROUGH,
     // If it simply isn't possible to represent a mismatched type on the wire (ie, protobuf).
     val mismatchedTypesUnrepresentable: Boolean = false,
+    // When changing a column to a PK, some destination set the column to a default value.
+    // This flag is addressing this behavior.
+    val dedupChangeUsesDefault: Boolean = false,
+    /**
+     * Whether the destination drops columns that no longer exist in the new schema during schema
+     * evolution. When set to [ColumnDropBehavior.RETAIN], tests expect previously-dropped columns
+     * to still be present in the table after schema changes.
+     */
+    val columnDropBehavior: ColumnDropBehavior = ColumnDropBehavior.DROP,
     nullEqualsUnset: Boolean = false,
     configUpdater: ConfigurationUpdater = FakeConfigurationUpdater,
     // Which medium to use as your input source for the test
     dataChannelMedium: DataChannelMedium = DataChannelMedium.STDIO,
     dataChannelFormat: DataChannelFormat = DataChannelFormat.JSONL,
+    val testSpeedModeStatsEmission: Boolean = true,
 ) :
     IntegrationTest(
         additionalMicronautEnvs = additionalMicronautEnvs,
@@ -315,23 +378,1177 @@ abstract class BasicFunctionalityIntegrationTest(
         dataChannelMedium = dataChannelMedium,
         dataChannelFormat = dataChannelFormat,
     ) {
-
     // Update config with any replacements.  This may be necessary when using testcontainers.
     val updatedConfig = configUpdater.update(configContents)
     val parsedConfig = ValidatedJsonUtils.parseOne(configSpecClass, updatedConfig)
+
+    /**
+     * When true, dedup tests will send all records over a single socket to preserve message
+     * ordering. This is needed for destinations that rely on record order for deduplication when
+     * using proto socket mode.
+     */
+    open val useSingleSocketForDedup: Boolean = false
+
+    @Test
+    open fun testOutOfOrderStateMessages() {
+        if (
+            dataChannelMedium != DataChannelMedium.SOCKET ||
+                dataChannelFormat != DataChannelFormat.PROTOBUF
+        ) {
+            return
+        }
+        val stream =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(linkedMapOf("id" to intType)), Append),
+            )
+        val messages =
+            runSync(
+                updatedConfig,
+                DestinationCatalog(listOf(stream)),
+                listOf(
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 0,
+                            additionalProperties =
+                                mapOf(CHECKPOINT_INDEX_NAME to 5, CHECKPOINT_ID_NAME to "1"),
+                        ),
+                    ),
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 0,
+                            additionalProperties =
+                                mapOf(CHECKPOINT_INDEX_NAME to 4, CHECKPOINT_ID_NAME to "2"),
+                        ),
+                    ),
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 0,
+                            additionalProperties =
+                                mapOf(CHECKPOINT_INDEX_NAME to 3, CHECKPOINT_ID_NAME to "3"),
+                        ),
+                    ),
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 0,
+                            additionalProperties =
+                                mapOf(CHECKPOINT_INDEX_NAME to 2, CHECKPOINT_ID_NAME to "4"),
+                        ),
+                    ),
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 0,
+                            additionalProperties =
+                                mapOf(CHECKPOINT_INDEX_NAME to 1, CHECKPOINT_ID_NAME to "5"),
+                        ),
+                    ),
+                ),
+            )
+
+        val stateMessages =
+            messages
+                .filter { it.type == AirbyteMessage.Type.STATE }
+                .withIndex()
+                .associate { (index, message) ->
+                    index to
+                        message.state.additionalProperties[CHECKPOINT_INDEX_NAME]!!
+                            .toString()
+                            .toInt()
+                }
+        assertEquals(5, stateMessages.size)
+
+        stateMessages.forEach { state -> assertEquals(state.key + 1, state.value) }
+    }
+
+    @Test
+    open fun testStateMessageBeforeRecords() {
+        if (
+            dataChannelMedium != DataChannelMedium.SOCKET ||
+                dataChannelFormat != DataChannelFormat.PROTOBUF
+        ) {
+            return
+        }
+        val stream =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(linkedMapOf("id" to intType)), Append),
+            )
+        val messages =
+            runSync(
+                updatedConfig,
+                DestinationCatalog(listOf(stream)),
+                listOf(
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 2,
+                            additionalProperties =
+                                mapOf(
+                                    CHECKPOINT_INDEX_NAME to 2,
+                                    CHECKPOINT_ID_NAME to "partition_2",
+                                ),
+                        ),
+                    ),
+                    InputStreamCheckpoint(
+                        StreamCheckpoint(
+                            unmappedNamespace = stream.unmappedNamespace,
+                            unmappedName = stream.unmappedName,
+                            blob =
+                                io.airbyte.protocol.models.Jsons.jsonNode(
+                                        mapOf("stream1" to "state"),
+                                    )
+                                    .toString(),
+                            sourceRecordCount = 1,
+                            additionalProperties =
+                                mapOf(
+                                    CHECKPOINT_INDEX_NAME to 1,
+                                    CHECKPOINT_ID_NAME to "partition_1",
+                                ),
+                        ),
+                    ),
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 1}""",
+                        emittedAtMs = 1234,
+                        checkpointId = CheckpointId("partition_1"),
+                    ),
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 2}""",
+                        emittedAtMs = 1234,
+                        checkpointId = CheckpointId("partition_2"),
+                    ),
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 3}""",
+                        emittedAtMs = 1234,
+                        checkpointId = CheckpointId("partition_2"),
+                    ),
+                ),
+            )
+
+        val stateMessages =
+            messages
+                .filter { m -> m.type == AirbyteMessage.Type.STATE }
+                .associateBy(
+                    keySelector = {
+                        it.state.additionalProperties[CHECKPOINT_INDEX_NAME]!!.toString().toInt()
+                    },
+                    valueTransform = { it.state.stream },
+                )
+
+        val stateMessagesOuter =
+            messages
+                .filter { m -> m.type == AirbyteMessage.Type.STATE }
+                .associateBy(
+                    keySelector = {
+                        it.state.additionalProperties[CHECKPOINT_INDEX_NAME]!!.toString().toInt()
+                    },
+                    valueTransform = { it.state },
+                )
+        assertEquals(2, stateMessages.size)
+
+        stateMessages[1]!!.also { state ->
+            assertEquals(
+                StreamDescriptor().withNamespace(randomizedNamespace).withName("test_stream"),
+                state.streamDescriptor,
+            )
+
+            assertEquals(
+                io.airbyte.protocol.models.Jsons.jsonNode(
+                    mapOf("stream1" to "state"),
+                ),
+                state.streamState,
+            )
+
+            stateMessagesOuter[1]!!.also { outer ->
+                assertEquals(
+                    mapOf(
+                        CHECKPOINT_ID_NAME to "partition_1",
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 56,
+                        CHECKPOINT_INDEX_NAME to 1,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 1,
+                    ),
+                    outer.additionalProperties,
+                )
+                assertEquals(
+                    AirbyteStateStats()
+                        .withRecordCount(1.0)
+                        .withAdditionalStats(expectedAdditionalStats()),
+                    outer.destinationStats,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(1.0),
+                    outer.sourceStats,
+                )
+            }
+        }
+
+        stateMessages[2]!!.also { state ->
+            assertEquals(
+                StreamDescriptor().withNamespace(randomizedNamespace).withName("test_stream"),
+                state.streamDescriptor,
+            )
+
+            assertEquals(
+                io.airbyte.protocol.models.Jsons.jsonNode(
+                    mapOf("stream1" to "state"),
+                ),
+                state.streamState,
+            )
+
+            stateMessagesOuter[2]!!.also { outer ->
+                assertEquals(
+                    mapOf(
+                        CHECKPOINT_ID_NAME to "partition_2",
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 168,
+                        CHECKPOINT_INDEX_NAME to 2,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 3,
+                    ),
+                    outer.additionalProperties,
+                )
+
+                assertEquals(
+                    AirbyteStateStats()
+                        .withRecordCount(2.0)
+                        .withAdditionalStats(expectedAdditionalStats()),
+                    outer.destinationStats,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(2.0),
+                    outer.sourceStats,
+                )
+            }
+        }
+    }
+
+    @Test
+    open fun testStreamStateTypes() {
+        if (
+            dataChannelMedium != DataChannelMedium.SOCKET ||
+                dataChannelFormat != DataChannelFormat.PROTOBUF
+        ) {
+            return
+        }
+        val idSchema = ObjectType(linkedMapOf("id" to intType))
+        val stream =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
+            )
+        val stream2 =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream_2",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
+            )
+        val stream3 =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream_3",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
+            )
+        val messages =
+            runSync(
+                updatedConfig,
+                DestinationCatalog(listOf(stream, stream2, stream3)),
+                listOf(
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 1}""",
+                        emittedAtMs = 1234,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    1,
+                                    "stream_1_partition_1",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputStreamCheckpoint(
+                        unmappedNamespace = stream.unmappedNamespace,
+                        unmappedName = stream.unmappedName,
+                        blob =
+                            io.airbyte.protocol.models.Jsons.jsonNode(
+                                    mapOf("stream1" to "state"),
+                                )
+                                .toString(),
+                        sourceRecordCount = 1,
+                        checkpointKey = checkpointKeyForMedium(1, "stream_1_partition_1"),
+                    ),
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 2}""",
+                        emittedAtMs = 1234,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    1,
+                                    "stream_2_partition_1",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 3}""",
+                        emittedAtMs = 1234,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    1,
+                                    "stream_2_partition_1",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputStreamCheckpoint(
+                        unmappedNamespace = stream2.unmappedNamespace,
+                        unmappedName = stream2.unmappedName,
+                        blob =
+                            io.airbyte.protocol.models.Jsons.jsonNode(
+                                    mapOf("stream2" to "state"),
+                                )
+                                .toString(),
+                        sourceRecordCount = 2,
+                        checkpointKey = checkpointKeyForMedium(1, "stream_2_partition_1"),
+                    ),
+                    InputRecord(
+                        stream = stream3,
+                        data = """{"id": 4}""",
+                        emittedAtMs = 1234,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    1,
+                                    "stream_3_partition_1",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputStreamCheckpoint(
+                        unmappedNamespace = stream3.unmappedNamespace,
+                        unmappedName = stream3.unmappedName,
+                        blob =
+                            io.airbyte.protocol.models.Jsons.jsonNode(
+                                    mapOf("stream3" to "state"),
+                                )
+                                .toString(),
+                        sourceRecordCount = 1,
+                        checkpointKey = checkpointKeyForMedium(1, "stream_3_partition_1"),
+                    ),
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 5}""",
+                        emittedAtMs = 5678,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    2,
+                                    "stream_1_partition_2",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 6}""",
+                        emittedAtMs = 5678,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    2,
+                                    "stream_2_partition_2",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream3,
+                        data = """{"id": 7}""",
+                        emittedAtMs = 5678,
+                        checkpointId =
+                            checkpointKeyForMedium(
+                                    2,
+                                    "stream_3_partition_2",
+                                )
+                                ?.checkpointId,
+                    ),
+                    InputStreamCheckpoint(
+                        unmappedNamespace = stream.unmappedNamespace,
+                        unmappedName = stream.unmappedName,
+                        blob =
+                            io.airbyte.protocol.models.Jsons.jsonNode(
+                                    mapOf("stream1" to "state2"),
+                                )
+                                .toString(),
+                        sourceRecordCount = 1,
+                        checkpointKey = checkpointKeyForMedium(2, "stream_1_partition_2"),
+                    ),
+                    InputStreamCheckpoint(
+                        unmappedNamespace = stream2.unmappedNamespace,
+                        unmappedName = stream2.unmappedName,
+                        blob =
+                            io.airbyte.protocol.models.Jsons.jsonNode(
+                                    mapOf("stream2" to "state2"),
+                                )
+                                .toString(),
+                        sourceRecordCount = 1,
+                        checkpointKey = checkpointKeyForMedium(2, "stream_2_partition_2"),
+                    ),
+                    InputStreamCheckpoint(
+                        unmappedNamespace = stream3.unmappedNamespace,
+                        unmappedName = stream3.unmappedName,
+                        blob =
+                            io.airbyte.protocol.models.Jsons.jsonNode(
+                                    mapOf("stream3" to "state2"),
+                                )
+                                .toString(),
+                        sourceRecordCount = 1,
+                        checkpointKey = checkpointKeyForMedium(2, "stream_3_partition_2"),
+                    ),
+                ),
+            )
+
+        val stateMessages =
+            messages.filter { m -> m.type == AirbyteMessage.Type.STATE }.map { it.state }
+
+        assertEquals(6, stateMessages.size)
+
+        val stateMessagesPerDescriptor =
+            stateMessages.groupBy({ it.stream.streamDescriptor }, { it })
+
+        val stateMessagesFromFirstStream =
+            stateMessagesPerDescriptor[
+                StreamDescriptor().withName("test_stream").withNamespace(randomizedNamespace),
+            ]
+        assertEquals(2, stateMessagesFromFirstStream!!.size)
+        assertEquals(
+            io.airbyte.protocol.models.Jsons.jsonNode(
+                mapOf("stream1" to "state"),
+            ),
+            stateMessagesFromFirstStream[0].stream.streamState,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0),
+            stateMessagesFromFirstStream[0].sourceStats,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0).withAdditionalStats(expectedAdditionalStats()),
+            stateMessagesFromFirstStream[0].destinationStats,
+        )
+        assertEquals(
+            mapOf<String, Any>(
+                "partition_id" to "stream_1_partition_1",
+                "committedBytesCount" to 65,
+                "id" to 1,
+                "committedRecordsCount" to 1,
+            ),
+            stateMessagesFromFirstStream[0].additionalProperties,
+        )
+        assertEquals(
+            io.airbyte.protocol.models.Jsons.jsonNode(
+                mapOf("stream1" to "state2"),
+            ),
+            stateMessagesFromFirstStream[1].stream.streamState,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0),
+            stateMessagesFromFirstStream[1].sourceStats,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0).withAdditionalStats(expectedAdditionalStats()),
+            stateMessagesFromFirstStream[1].destinationStats,
+        )
+        assertEquals(
+            mapOf<String, Any>(
+                "partition_id" to "stream_1_partition_2",
+                "committedBytesCount" to 130,
+                "id" to 2,
+                "committedRecordsCount" to 2,
+            ),
+            stateMessagesFromFirstStream[1].additionalProperties,
+        )
+
+        val stateMessagesFromSecondStream =
+            stateMessagesPerDescriptor[
+                StreamDescriptor().withName("test_stream_2").withNamespace(randomizedNamespace),
+            ]
+        assertEquals(2, stateMessagesFromSecondStream!!.size)
+        assertEquals(
+            io.airbyte.protocol.models.Jsons.jsonNode(
+                mapOf("stream2" to "state"),
+            ),
+            stateMessagesFromSecondStream[0].stream.streamState,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(2.0),
+            stateMessagesFromSecondStream[0].sourceStats,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(2.0).withAdditionalStats(expectedAdditionalStats()),
+            stateMessagesFromSecondStream[0].destinationStats,
+        )
+        assertEquals(
+            mapOf<String, Any>(
+                "partition_id" to "stream_2_partition_1",
+                "committedBytesCount" to 134,
+                "id" to 1,
+                "committedRecordsCount" to 2,
+            ),
+            stateMessagesFromSecondStream[0].additionalProperties,
+        )
+        assertEquals(
+            io.airbyte.protocol.models.Jsons.jsonNode(
+                mapOf("stream2" to "state2"),
+            ),
+            stateMessagesFromSecondStream[1].stream.streamState,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0),
+            stateMessagesFromSecondStream[1].sourceStats,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0).withAdditionalStats(expectedAdditionalStats()),
+            stateMessagesFromSecondStream[1].destinationStats,
+        )
+        assertEquals(
+            mapOf<String, Any>(
+                "partition_id" to "stream_2_partition_2",
+                "committedBytesCount" to 201,
+                "id" to 2,
+                "committedRecordsCount" to 3,
+            ),
+            stateMessagesFromSecondStream[1].additionalProperties,
+        )
+
+        val stateMessagesFromThirdStream =
+            stateMessagesPerDescriptor[
+                StreamDescriptor().withName("test_stream_3").withNamespace(randomizedNamespace),
+            ]
+        assertEquals(2, stateMessagesFromThirdStream!!.size)
+        assertEquals(
+            io.airbyte.protocol.models.Jsons.jsonNode(
+                mapOf("stream3" to "state"),
+            ),
+            stateMessagesFromThirdStream[0].stream.streamState,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0),
+            stateMessagesFromThirdStream[0].sourceStats,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0).withAdditionalStats(expectedAdditionalStats()),
+            stateMessagesFromThirdStream[0].destinationStats,
+        )
+        assertEquals(
+            mapOf<String, Any>(
+                "partition_id" to "stream_3_partition_1",
+                "committedBytesCount" to 67,
+                "id" to 1,
+                "committedRecordsCount" to 1,
+            ),
+            stateMessagesFromThirdStream[0].additionalProperties,
+        )
+        assertEquals(
+            io.airbyte.protocol.models.Jsons.jsonNode(
+                mapOf("stream3" to "state2"),
+            ),
+            stateMessagesFromThirdStream[1].stream.streamState,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0),
+            stateMessagesFromSecondStream[1].sourceStats,
+        )
+        assertEquals(
+            AirbyteStateStats().withRecordCount(1.0).withAdditionalStats(expectedAdditionalStats()),
+            stateMessagesFromSecondStream[1].destinationStats,
+        )
+        assertEquals(
+            mapOf<String, Any>(
+                "partition_id" to "stream_3_partition_2",
+                "committedBytesCount" to 134,
+                "id" to 2,
+                "committedRecordsCount" to 2,
+            ),
+            stateMessagesFromThirdStream[1].additionalProperties,
+        )
+    }
+
+    @Test
+    open fun testCDCStateTypes() {
+        if (
+            dataChannelMedium != DataChannelMedium.SOCKET ||
+                dataChannelFormat != DataChannelFormat.PROTOBUF
+        ) {
+            return
+        }
+        val idSchema = ObjectType(linkedMapOf("id" to intType))
+        val stream =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
+            )
+        val stream2 =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream_2",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
+            )
+        val stream3 =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream_3",
+                generationId = 0,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
+            )
+        val messages =
+            runSync(
+                updatedConfig,
+                DestinationCatalog(listOf(stream, stream2, stream3)),
+                listOf(
+                    // record from snapshot
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 1}""",
+                        emittedAtMs = 1234,
+                        checkpointId = checkpointKeyForMedium(1, "partition_1")?.checkpointId,
+                    ),
+                    // record from snapshot
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 2}""",
+                        emittedAtMs = 1234,
+                        checkpointId = checkpointKeyForMedium(1, "partition_2")?.checkpointId,
+                    ),
+                    // record from binlog
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 3}""",
+                        emittedAtMs = 1234,
+                        checkpointId = checkpointKeyForMedium(1, "outer_partition")?.checkpointId,
+                    ),
+                    // record from binlog
+                    InputRecord(
+                        stream = stream3,
+                        data = """{"id": 4}""",
+                        emittedAtMs = 1234,
+                        checkpointId = checkpointKeyForMedium(1, "outer_partition")?.checkpointId,
+                    ),
+                    InputGlobalCheckpoint(
+                        sharedState =
+                            io.airbyte.protocol.models.Jsons.jsonNode(mapOf("shared" to "state")),
+                        checkpointKey = checkpointKeyForMedium(1, "outer_partition"),
+                        streamStates =
+                            listOf(
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream.unmappedNamespace,
+                                    unmappedName = stream.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream1" to "state"),
+                                        ),
+                                    additionalProperties =
+                                        linkedMapOf(
+                                            CHECKPOINT_INDEX_NAME to 1,
+                                            CHECKPOINT_ID_NAME to "partition_1",
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream2.unmappedNamespace,
+                                    unmappedName = stream2.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream2" to "state"),
+                                        ),
+                                    additionalProperties =
+                                        linkedMapOf(
+                                            CHECKPOINT_INDEX_NAME to 1,
+                                            CHECKPOINT_ID_NAME to "partition_2",
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream3.unmappedNamespace,
+                                    unmappedName = stream3.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream3" to "state"),
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = "namespace-not-present-in-catalog",
+                                    unmappedName = "stream-not-present-in-catalog",
+                                    state = io.airbyte.protocol.models.Jsons.emptyObject(),
+                                ),
+                            ),
+                        sourceRecordCount = 4,
+                    ),
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 5}""",
+                        emittedAtMs = 5678,
+                        checkpointId = checkpointKeyForMedium(2, "partition_5")?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 6}""",
+                        emittedAtMs = 5678,
+                        checkpointId = checkpointKeyForMedium(2, "partition_6")?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream3,
+                        data = """{"id": 7}""",
+                        emittedAtMs = 5678,
+                        checkpointId = checkpointKeyForMedium(2, "partition_7")?.checkpointId,
+                    ),
+                    InputGlobalCheckpoint(
+                        sharedState =
+                            io.airbyte.protocol.models.Jsons.jsonNode(mapOf("shared" to "state")),
+                        checkpointKey = checkpointKeyForMedium(2, "outer_partition_2"),
+                        streamStates =
+                            listOf(
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream.unmappedNamespace,
+                                    unmappedName = stream.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream1" to "state"),
+                                        ),
+                                    additionalProperties =
+                                        linkedMapOf(
+                                            CHECKPOINT_INDEX_NAME to 2,
+                                            CHECKPOINT_ID_NAME to "partition_5",
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream2.unmappedNamespace,
+                                    unmappedName = stream2.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream2" to "state"),
+                                        ),
+                                    additionalProperties =
+                                        linkedMapOf(
+                                            CHECKPOINT_INDEX_NAME to 2,
+                                            CHECKPOINT_ID_NAME to "partition_6",
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream3.unmappedNamespace,
+                                    unmappedName = stream3.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream3" to "state"),
+                                        ),
+                                    additionalProperties =
+                                        linkedMapOf(
+                                            CHECKPOINT_INDEX_NAME to 2,
+                                            CHECKPOINT_ID_NAME to "partition_7",
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = "namespace-not-present-in-catalog",
+                                    unmappedName = "stream-not-present-in-catalog",
+                                    state = io.airbyte.protocol.models.Jsons.emptyObject(),
+                                ),
+                            ),
+                        sourceRecordCount = 3,
+                    ),
+                    InputRecord(
+                        stream = stream,
+                        data = """{"id": 8}""",
+                        emittedAtMs = 5678,
+                        checkpointId = checkpointKeyForMedium(3, "outer_partition_3")?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream2,
+                        data = """{"id": 9}""",
+                        emittedAtMs = 5678,
+                        checkpointId = checkpointKeyForMedium(3, "outer_partition_3")?.checkpointId,
+                    ),
+                    InputRecord(
+                        stream = stream3,
+                        data = """{"id": 10}""",
+                        emittedAtMs = 5678,
+                        checkpointId = checkpointKeyForMedium(3, "outer_partition_3")?.checkpointId,
+                    ),
+                    InputGlobalCheckpoint(
+                        sharedState =
+                            io.airbyte.protocol.models.Jsons.jsonNode(mapOf("shared" to "state")),
+                        checkpointKey = checkpointKeyForMedium(3, "outer_partition_3"),
+                        streamStates =
+                            listOf(
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream.unmappedNamespace,
+                                    unmappedName = stream.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream1" to "state"),
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream2.unmappedNamespace,
+                                    unmappedName = stream2.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream2" to "state"),
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = stream3.unmappedNamespace,
+                                    unmappedName = stream3.unmappedName,
+                                    state =
+                                        io.airbyte.protocol.models.Jsons.jsonNode(
+                                            mapOf("stream3" to "state"),
+                                        ),
+                                ),
+                                CheckpointMessage.Checkpoint(
+                                    unmappedNamespace = "namespace-not-present-in-catalog",
+                                    unmappedName = "stream-not-present-in-catalog",
+                                    state = io.airbyte.protocol.models.Jsons.emptyObject(),
+                                ),
+                            ),
+                        sourceRecordCount = 3,
+                    ),
+                ),
+            )
+
+        val stateMessages =
+            messages
+                .filter { m -> m.type == AirbyteMessage.Type.STATE }
+                .associateBy(
+                    keySelector = {
+                        it.state.additionalProperties[CHECKPOINT_INDEX_NAME]!!.toString().toInt()
+                    },
+                    valueTransform = { it.state.global },
+                )
+
+        val stateMessagesOuter =
+            messages
+                .filter { m -> m.type == AirbyteMessage.Type.STATE }
+                .associateBy(
+                    keySelector = {
+                        it.state.additionalProperties[CHECKPOINT_INDEX_NAME]!!.toString().toInt()
+                    },
+                    valueTransform = { it.state },
+                )
+
+        val firstStream =
+            StreamDescriptor().withName("test_stream").withNamespace(randomizedNamespace)
+        val secondStream =
+            StreamDescriptor().withName("test_stream_2").withNamespace(randomizedNamespace)
+        val thirdStream =
+            StreamDescriptor().withName("test_stream_3").withNamespace(randomizedNamespace)
+
+        assertEquals(3, stateMessages.size)
+        val firstStateMessage = stateMessages[1]!!
+
+        firstStateMessage.also { state ->
+            assertEquals(
+                io.airbyte.protocol.models.Jsons.jsonNode(mapOf("shared" to "state")),
+                state.sharedState,
+            )
+
+            val streamStatesMappedByStreamNames =
+                state.streamStates.associateBy { it.streamDescriptor }
+
+            assertEquals(4, streamStatesMappedByStreamNames.size)
+
+            streamStatesMappedByStreamNames.also {
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream1" to "state")),
+                    it[firstStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 56,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 1,
+                    ),
+                    it[firstStream]!!.additionalProperties,
+                )
+
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream2" to "state")),
+                    it[secondStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 120,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 2,
+                    ),
+                    it[secondStream]!!.additionalProperties,
+                )
+
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream3" to "state")),
+                    it[thirdStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 62,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 1,
+                    ),
+                    it[thirdStream]!!.additionalProperties,
+                )
+            }
+
+            stateMessagesOuter[1]!!.also { outer ->
+                assertEquals(
+                    mapOf(
+                        CHECKPOINT_ID_NAME to "outer_partition",
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 238,
+                        CHECKPOINT_INDEX_NAME to 1,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 4,
+                    ),
+                    outer.additionalProperties,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(4.0),
+                    outer.destinationStats,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(4.0),
+                    outer.sourceStats,
+                )
+            }
+        }
+
+        val secondStateMessage = stateMessages[2]!!
+        secondStateMessage.also { state ->
+            assertEquals(
+                io.airbyte.protocol.models.Jsons.jsonNode(mapOf("shared" to "state")),
+                state.sharedState,
+            )
+
+            val streamStatesMappedByStreamNames =
+                state.streamStates.associateBy { it.streamDescriptor }
+
+            assertEquals(4, streamStatesMappedByStreamNames.size)
+
+            streamStatesMappedByStreamNames.also {
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream1" to "state")),
+                    it[firstStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 112,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 2,
+                    ),
+                    it[firstStream]!!.additionalProperties,
+                )
+
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream2" to "state")),
+                    it[secondStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 178,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 3,
+                    ),
+                    it[secondStream]!!.additionalProperties,
+                )
+
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream3" to "state")),
+                    it[thirdStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 120,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 2,
+                    ),
+                    it[thirdStream]!!.additionalProperties,
+                )
+            }
+
+            stateMessagesOuter[2]!!.also { outer ->
+                assertEquals(
+                    mapOf(
+                        CHECKPOINT_ID_NAME to "outer_partition_2",
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 410,
+                        CHECKPOINT_INDEX_NAME to 2,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 7,
+                    ),
+                    outer.additionalProperties,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(3.0),
+                    outer.destinationStats,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(3.0),
+                    outer.sourceStats,
+                )
+            }
+        }
+
+        val thirdStateMessage = stateMessages[3]!!
+        thirdStateMessage.also { state ->
+            assertEquals(
+                io.airbyte.protocol.models.Jsons.jsonNode(mapOf("shared" to "state")),
+                state.sharedState,
+            )
+
+            val streamStatesMappedByStreamNames =
+                state.streamStates.associateBy { it.streamDescriptor }
+
+            assertEquals(4, streamStatesMappedByStreamNames.size)
+
+            streamStatesMappedByStreamNames.also {
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream1" to "state")),
+                    it[firstStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 174,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 3,
+                    ),
+                    it[firstStream]!!.additionalProperties,
+                )
+
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream2" to "state")),
+                    it[secondStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 242,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 4,
+                    ),
+                    it[secondStream]!!.additionalProperties,
+                )
+
+                assertEquals(
+                    io.airbyte.protocol.models.Jsons.jsonNode(mapOf("stream3" to "state")),
+                    it[thirdStream]!!.streamState,
+                )
+
+                assertEquals(
+                    mapOf(
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 184,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 3,
+                    ),
+                    it[thirdStream]!!.additionalProperties,
+                )
+            }
+
+            stateMessagesOuter[3]!!.also { outer ->
+                assertEquals(
+                    mapOf(
+                        CHECKPOINT_ID_NAME to "outer_partition_3",
+                        CheckpointMessage.COMMITTED_BYTES_COUNT to 600,
+                        CHECKPOINT_INDEX_NAME to 3,
+                        CheckpointMessage.COMMITTED_RECORDS_COUNT to 10,
+                    ),
+                    outer.additionalProperties,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(3.0),
+                    outer.destinationStats,
+                )
+
+                assertEquals(
+                    AirbyteStateStats().withRecordCount(3.0),
+                    outer.sourceStats,
+                )
+            }
+        }
+    }
 
     @Test
     open fun testBasicWrite() {
         val stream =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(linkedMapOf("id" to intType)),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 0,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(linkedMapOf("id" to intType)), Append),
             )
         val messages =
             runSync(
@@ -340,7 +1557,7 @@ abstract class BasicFunctionalityIntegrationTest(
                 listOf(
                     InputRecord(
                         stream = stream,
-                        data = """{"id": 5678, "undeclared": "asdf"}""",
+                        data = """{"id": 5678}""",
                         emittedAtMs = 1234,
                         changes =
                             mutableListOf(
@@ -349,44 +1566,56 @@ abstract class BasicFunctionalityIntegrationTest(
                                     change = AirbyteRecordMessageMetaChange.Change.NULLED,
                                     reason =
                                         AirbyteRecordMessageMetaChange.Reason
-                                            .SOURCE_FIELD_SIZE_LIMITATION
-                                )
+                                            .SOURCE_FIELD_SIZE_LIMITATION,
+                                ),
                             ),
-                        checkpointId = checkpointKeyForMedium()?.checkpointId
+                        checkpointId = checkpointKeyForMedium()?.checkpointId,
                     ),
                     InputStreamCheckpoint(
-                        stream = stream,
+                        unmappedName = stream.unmappedName,
+                        unmappedNamespace = stream.unmappedNamespace,
                         blob = """{"foo": "bar"}""",
                         sourceRecordCount = 1,
                         checkpointKey = checkpointKeyForMedium(),
-                    )
+                    ),
                 ),
             )
 
         val stateMessages = messages.filter { it.type == AirbyteMessage.Type.STATE }
+
+        // Only used for speed mode (unnecessary to test if dest does not support speed)
+        val expectedBytes =
+            if (testSpeedModeStatsEmission) expectedBytesForMediumAndFormat(214L, 234L, 56L)
+            else null
+
         assertAll(
             {
                 assertEquals(
                     1,
                     stateMessages.size,
-                    "Expected to receive exactly one state message, got ${stateMessages.size} ($stateMessages)"
+                    "Expected to receive exactly one state message, got ${stateMessages.size} ($stateMessages)",
                 )
 
                 val asProtocolMessage =
                     StreamCheckpoint(
-                            stream = stream,
+                            unmappedName = stream.unmappedName,
+                            unmappedNamespace = stream.unmappedNamespace,
                             blob = """{"foo": "bar"}""",
                             sourceRecordCount = 1,
                             destinationRecordCount = 1,
                             checkpointKey = checkpointKeyForMedium(),
                             totalRecords = 1L,
-                            totalBytes = expectedBytesForMediumAndFormat(234L, 254L, 59L)
+                            totalBytes = expectedBytes,
+                            additionalStats =
+                                StateAdditionalStatsStore.ObservabilityMetrics.entries
+                                    .associate { it.metricName to 0.0 }
+                                    .toMutableMap(),
                         )
                         .asProtocolMessage()
                 assertEquals(
                     Jsons.readValue(
                         Jsons.writeValueAsBytes(asProtocolMessage),
-                        AirbyteMessage::class.java
+                        AirbyteMessage::class.java,
                     ),
                     stateMessages.first(),
                 )
@@ -399,12 +1628,7 @@ abstract class BasicFunctionalityIntegrationTest(
                             OutputRecord(
                                 extractedAt = 1234,
                                 generationId = 0,
-                                data =
-                                    if (preserveUndeclaredFields) {
-                                        mapOf("id" to 5678, "undeclared" to "asdf")
-                                    } else {
-                                        mapOf("id" to 5678)
-                                    },
+                                data = mapOf("id" to 5678),
                                 airbyteMeta =
                                     OutputRecord.Meta(
                                         changes =
@@ -416,12 +1640,12 @@ abstract class BasicFunctionalityIntegrationTest(
                                                             .NULLED,
                                                     reason =
                                                         AirbyteRecordMessageMetaChange.Reason
-                                                            .SOURCE_FIELD_SIZE_LIMITATION
-                                                )
+                                                            .SOURCE_FIELD_SIZE_LIMITATION,
+                                                ),
                                             ),
-                                        syncId = 42
-                                    )
-                            )
+                                        syncId = 42,
+                                    ),
+                            ),
                         ),
                         stream,
                         primaryKey = listOf(listOf("id")),
@@ -432,108 +1656,28 @@ abstract class BasicFunctionalityIntegrationTest(
         )
     }
 
-    @Test
-    open fun testBasicWriteFile() {
-        assumeTrue(supportFileTransfer)
-        val stream =
-            DestinationStream(
-                randomizedNamespace,
-                "test_stream_file",
-                Append,
-                ObjectType(linkedMapOf("id" to intType)),
-                generationId = 0,
-                minimumGenerationId = 0,
-                syncId = 42,
-                isFileBased = true,
-                includeFiles = true,
-                namespaceMapper = namespaceMapperForMedium()
-            )
-
-        val sourcePath = "path/to/file"
-        // these must match the values hard-coded in DockerizedDestination
-        val stagingDir = "tmp"
-        val fileName = "test_file"
-        val fileContents = "123"
-
-        val fileReference =
-            AirbyteRecordMessageFileReference()
-                .withSourceFileRelativePath(sourcePath)
-                .withStagingFileUrl("/$stagingDir/$fileName")
-                .withFileSizeBytes(1234L)
-
-        val input =
-            InputRecord(
-                stream = stream,
-                data = """{"id": 5678}""",
-                emittedAtMs = 1234,
-                changes = mutableListOf(),
-                fileReference = fileReference,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
-            )
-
-        val messages =
-            runSync(
-                updatedConfig,
-                stream,
-                listOf(
-                    input,
-                    InputStreamCheckpoint(
-                        stream = stream,
-                        blob = """{"foo": "bar"}""",
-                        sourceRecordCount = 1,
-                        checkpointKey = checkpointKeyForMedium(),
-                    )
-                ),
-                useFileTransfer = true,
-            )
-
-        val stateMessages = messages.filter { it.type == AirbyteMessage.Type.STATE }
-        assertAll({
-            assertEquals(
-                1,
-                stateMessages.size,
-                "Expected to receive exactly one state message, got ${stateMessages.size} ($stateMessages)"
-            )
-            assertEquals(
-                StreamCheckpoint(
-                        stream = stream,
-                        blob = """{"foo": "bar"}""",
-                        sourceRecordCount = 1,
-                        destinationRecordCount = 1,
-                        checkpointKey = checkpointKeyForMedium(),
-                        // Files doesn't need these, but they get added anyway
-                        totalRecords = 1,
-                        totalBytes = 267L
-                    )
-                    .asProtocolMessage()
-                    .serializeToString(),
-                stateMessages.first().serializeToString()
-            )
-        })
-
-        val config = ValidatedJsonUtils.parseOne(configSpecClass, updatedConfig)
-        val fileContent = dataDumper.dumpFile(config, stream)
-
-        assertEquals(fileContents, fileContent[sourcePath])
-    }
-
+    /**
+     * Runs a sync, kills it before finishing, then asserts second sync finishes moving the data to
+     * the final table.
+     *
+     * Tests any sort of 2 phase commit write operation recovers from failure.
+     */
     @Test
     open fun testMidSyncCheckpointingStreamState(): Unit =
         runBlocking(Dispatchers.IO) {
             assumeTrue(verifyDataWriting)
             val stream =
                 DestinationStream(
-                    randomizedNamespace,
-                    "test_stream",
-                    Append,
-                    ObjectType(linkedMapOf("id" to intType)),
+                    unmappedNamespace = randomizedNamespace,
+                    unmappedName = "test_stream",
                     generationId = 0,
                     minimumGenerationId = 0,
                     syncId = 42,
-                    namespaceMapper = namespaceMapperForMedium()
+                    namespaceMapper = namespaceMapperForMedium(),
+                    tableSchema = makeTableSchema(ObjectType(linkedMapOf("id" to intType)), Append),
                 )
             val stateMessage =
-                runSyncUntilStateAck(
+                runSyncUntilStateAckAndExpectFailure(
                     this@BasicFunctionalityIntegrationTest.updatedConfig,
                     stream,
                     listOf(
@@ -541,16 +1685,17 @@ abstract class BasicFunctionalityIntegrationTest(
                             stream = stream,
                             data = """{"id": 12}""",
                             emittedAtMs = 1234,
-                            checkpointId = checkpointKeyForMedium()?.checkpointId
-                        )
+                            checkpointId = checkpointKeyForMedium()?.checkpointId,
+                        ),
                     ),
                     StreamCheckpoint(
-                        stream = stream,
+                        unmappedName = stream.unmappedName,
+                        unmappedNamespace = stream.unmappedNamespace,
                         blob = """{"foo": "bar1"}""",
                         sourceRecordCount = 1,
-                        checkpointKey = checkpointKeyForMedium()
+                        checkpointKey = checkpointKeyForMedium(),
                     ),
-                    allowGracefulShutdown = false,
+                    syncEndBehavior = UncleanSyncEndBehavior.KILL,
                 )
             runSync(this@BasicFunctionalityIntegrationTest.updatedConfig, stream, emptyList())
 
@@ -564,22 +1709,22 @@ abstract class BasicFunctionalityIntegrationTest(
                     assertEquals(
                         streamName,
                         "test_stream",
-                        "Expected stream name to be test_stream, got $streamName"
+                        "Expected stream name to be test_stream, got $streamName",
                     )
                 },
                 {
                     assertEquals(
                         1.0,
                         stateMessage.destinationStats.recordCount,
-                        "Expected destination stats to show 1 record"
+                        "Expected destination stats to show 1 record",
                     )
                 },
                 {
                     assertEquals(
                         """{"foo": "bar1"}""".deserializeToNode(),
-                        stateMessage.stream.streamState
+                        stateMessage.stream.streamState,
                     )
-                }
+                },
             )
             if (verifyDataWriting) {
                 dumpAndDiffRecords(
@@ -589,8 +1734,8 @@ abstract class BasicFunctionalityIntegrationTest(
                             extractedAt = 1234,
                             generationId = 0,
                             data = mapOf("id" to 12),
-                            airbyteMeta = OutputRecord.Meta(syncId = 42)
-                        )
+                            airbyteMeta = OutputRecord.Meta(syncId = 42),
+                        ),
                     ),
                     stream,
                     primaryKey = listOf(listOf("id")),
@@ -603,20 +1748,20 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testNamespaces() {
         assumeTrue(verifyDataWriting)
+        val idSchema = ObjectType(linkedMapOf("id" to intType))
         fun makeStream(namespace: String?) =
             DestinationStream(
                 // We need to randomize the stream name for destinations which support
                 // namespace=null natively.
                 // Otherwise, multiple test runs would write to `<null>.test_stream`.
                 // Now, they instead write to `<null>.test_stream_test20250123abcd`.
-                namespace,
-                "test_stream_$randomizedNamespace",
-                Append,
-                ObjectType(linkedMapOf("id" to intType)),
+                unmappedNamespace = namespace,
+                unmappedName = "test_stream_$randomizedNamespace",
                 generationId = 0,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
             )
         val stream1 = makeStream(randomizedNamespace + "_1")
         val stream2 = makeStream(randomizedNamespace + "_2")
@@ -630,28 +1775,28 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream1,
                     stream2,
                     streamWithDefaultNamespace,
-                )
+                ),
             ),
             listOf(
                 InputRecord(
                     stream = stream1,
                     data = """{"id": 1234}""",
                     emittedAtMs = 1234,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
                 InputRecord(
                     stream = stream2,
                     data = """{"id": 5678}""",
                     emittedAtMs = 1234,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
                 InputRecord(
                     stream = streamWithDefaultNamespace,
                     data = """{"id": 91011}""",
                     emittedAtMs = 1234,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
-            )
+            ),
         )
         assertAll(
             {
@@ -662,12 +1807,12 @@ abstract class BasicFunctionalityIntegrationTest(
                             extractedAt = 1234,
                             generationId = 0,
                             data = mapOf("id" to 1234),
-                            airbyteMeta = OutputRecord.Meta(syncId = 42)
-                        )
+                            airbyteMeta = OutputRecord.Meta(syncId = 42),
+                        ),
                     ),
                     stream1,
                     listOf(listOf("id")),
-                    cursor = null
+                    cursor = null,
                 )
             },
             {
@@ -678,12 +1823,12 @@ abstract class BasicFunctionalityIntegrationTest(
                             extractedAt = 1234,
                             generationId = 0,
                             data = mapOf("id" to 5678),
-                            airbyteMeta = OutputRecord.Meta(syncId = 42)
-                        )
+                            airbyteMeta = OutputRecord.Meta(syncId = 42),
+                        ),
                     ),
                     stream2,
                     listOf(listOf("id")),
-                    cursor = null
+                    cursor = null,
                 )
             },
             {
@@ -694,14 +1839,14 @@ abstract class BasicFunctionalityIntegrationTest(
                             extractedAt = 1234,
                             generationId = 0,
                             data = mapOf("id" to 91011),
-                            airbyteMeta = OutputRecord.Meta(syncId = 42)
-                        )
+                            airbyteMeta = OutputRecord.Meta(syncId = 42),
+                        ),
                     ),
                     streamWithDefaultNamespace.copy(unmappedNamespace = actualDefaultNamespace),
                     listOf(listOf("id")),
-                    cursor = null
+                    cursor = null,
                 )
-            }
+            },
         )
     }
 
@@ -714,14 +1859,13 @@ abstract class BasicFunctionalityIntegrationTest(
             namespaceSuffix: String = "",
         ) =
             DestinationStream(
-                randomizedNamespace + namespaceSuffix,
-                name,
-                Append,
-                ObjectType(schema),
+                unmappedNamespace = randomizedNamespace + namespaceSuffix,
+                unmappedName = name,
                 generationId = 0,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(schema), Append),
             )
         // Catalog with some weird schemas.
         // Every stream has an int `id`, and maybe some string fields.
@@ -736,6 +1880,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     makeStream("stream_name_with_operator+1"),
                     makeStream("stream_name_with_numbers_123"),
                     makeStream("1stream_with_a_leading_number"),
+                    makeStream("c'est une belle histoire,./<>?'\";[]\\:{}|`~!@#\$%^&*()_+-="),
                     makeStream(
                         "stream_with_edge_case_field_names_and_values",
                         linkedMapOf(
@@ -751,45 +1896,46 @@ abstract class BasicFunctionalityIntegrationTest(
                             "order" to stringType,
                             "ProperCase" to stringType,
                             "Foo.Bar" to stringType,
-                        )
+                        ),
                     ),
                     // this is apparently trying to test for reserved words?
                     // https://github.com/airbytehq/airbyte/pull/1753
                     makeStream(
                         "groups",
-                        linkedMapOf("id" to intType, "authorization" to stringType)
+                        linkedMapOf("id" to intType, "authorization" to stringType),
                     ),
                     makeStream(
                         "streamWithSpecialCharactersInNamespace",
-                        namespaceSuffix = "_spøcial"
+                        namespaceSuffix = "_spøcial",
                     ),
                     makeStream("streamWithOperatorInNamespace", namespaceSuffix = "_operator-1"),
-                )
+                ),
             )
         // For each stream, generate a record containing every field in the schema.
         // The id field is always 42, and the string fields are always "foo\nbar".
         val messages =
             catalog.streams.map { stream ->
+                val streamSchema = stream.tableSchema.columnSchema.inputSchema
                 InputRecord(
                     stream,
                     ObjectValue(
-                        (stream.schema as ObjectType)
-                            .properties
+                        streamSchema
                             .mapValuesTo(linkedMapOf<String, AirbyteValue>()) {
                                 StringValue("foo\nbar")
                             }
-                            .also { it["id"] = IntegerValue(42) }
+                            .also { it["id"] = IntegerValue(42) },
                     ),
                     emittedAtMs = 1234,
                     meta = null,
                     serialized = "",
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 )
             }
         runSync(updatedConfig, catalog, messages)
         assertAll(
             catalog.streams.map { stream ->
                 {
+                    val streamSchema = stream.tableSchema.columnSchema.inputSchema
                     dumpAndDiffRecords(
                         parsedConfig,
                         listOf(
@@ -797,19 +1943,18 @@ abstract class BasicFunctionalityIntegrationTest(
                                 extractedAt = 1234,
                                 generationId = 0,
                                 data =
-                                    (stream.schema as ObjectType)
-                                        .properties
+                                    streamSchema
                                         .mapValuesTo(linkedMapOf<String, Any>()) { "foo\nbar" }
                                         .also { it["id"] = 42 },
-                                airbyteMeta = OutputRecord.Meta(syncId = 42)
-                            )
+                                airbyteMeta = OutputRecord.Meta(syncId = 42),
+                            ),
                         ),
                         stream,
                         primaryKey = listOf(listOf("id")),
                         cursor = null,
                     )
                 }
-            }
+            },
         )
     }
 
@@ -824,33 +1969,34 @@ abstract class BasicFunctionalityIntegrationTest(
     open fun testFunkyCharactersDedup() {
         assumeTrue(verifyDataWriting)
         assumeTrue(dedupBehavior != null)
+        val importType =
+            Dedupe(
+                // the actual string here is id~!@#$%^&*()`[]{}|;':",./<>?
+                // note: no `\` character, because it causes significant problems in some
+                // destinations (T+D destinations with noncompliant JSONPath
+                // implementations,
+                // e.g. bigquery)
+                primaryKey = listOf(listOf("id~!@#\$%^&*()`[]{}|;':\",./<>?")),
+                cursor = listOf("updated_at~!@#$%^&*()`[]{}|;':\",./<>?"),
+            )
+        val schema =
+            ObjectType(
+                properties =
+                    linkedMapOf(
+                        "id~!@#\$%^&*()`[]{}|;':\",./<>?" to intType,
+                        "updated_at~!@#\$%^&*()`[]{}|;':\",./<>?" to timestamptzType,
+                        "name~!@#\$%^&*()`[]{}|;':\",./<>?" to stringType,
+                    ),
+            )
         val stream =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                importType =
-                    Dedupe(
-                        // the actual string here is id~!@#$%^&*()`[]{}|;':",./<>?
-                        // note: no `\` character, because it causes significant problems in some
-                        // destinations (T+D destinations with noncompliant JSONPath
-                        // implementations,
-                        // e.g. bigquery)
-                        primaryKey = listOf(listOf("id~!@#\$%^&*()`[]{}|;':\",./<>?")),
-                        cursor = listOf("updated_at~!@#$%^&*()`[]{}|;':\",./<>?"),
-                    ),
-                schema =
-                    ObjectType(
-                        properties =
-                            linkedMapOf(
-                                "id~!@#\$%^&*()`[]{}|;':\",./<>?" to intType,
-                                "updated_at~!@#\$%^&*()`[]{}|;':\",./<>?" to timestamptzType,
-                                "name~!@#\$%^&*()`[]{}|;':\",./<>?" to stringType,
-                            )
-                    ),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(schema, importType),
             )
         runSync(
             updatedConfig,
@@ -863,11 +2009,13 @@ abstract class BasicFunctionalityIntegrationTest(
                       "id~!@#${'$'}%^&*()`[]{}|;':\",./<>?": 1,
                       "updated_at~!@#${'$'}%^&*()`[]{}|;':\",./<>?": "2000-01-01T00:00:00Z",
                       "name~!@#${'$'}%^&*()`[]{}|;':\",./<>?": "Alice1"
-                    }""".trimIndent(),
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1000,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -895,18 +2043,23 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testTruncateRefresh() {
         assumeTrue(verifyDataWriting)
+        val idNameSchema = ObjectType(linkedMapOf("id" to intType, "name" to stringType))
         fun makeStream(generationId: Long, minimumGenerationId: Long, syncId: Long) =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(linkedMapOf("id" to intType, "name" to stringType)),
-                generationId,
-                minimumGenerationId,
-                syncId,
-                namespaceMapper = namespaceMapperForMedium()
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = generationId,
+                minimumGenerationId = minimumGenerationId,
+                syncId = syncId,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idNameSchema, Append),
             )
-        val stream = makeStream(12, 0, 42)
+        val stream =
+            makeStream(
+                generationId = 12,
+                minimumGenerationId = 0,
+                syncId = 42,
+            )
         runSync(
             updatedConfig,
             stream,
@@ -915,32 +2068,201 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream = stream,
                     """{"id": 42, "name": "first_value"}""",
                     emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
+
         val finalStream = makeStream(generationId = 13, minimumGenerationId = 13, syncId = 43)
-        runSync(
+        // start a truncate refresh, but emit INCOMPLETE.
+        // This should retain the existing data, and maybe insert the new record.
+        runSyncUntilStateAckAndExpectFailure(
             updatedConfig,
             finalStream,
             listOf(
                 InputRecord(
                     stream = stream,
                     """{"id": 42, "name": "second_value"}""",
-                    emittedAtMs = 1234,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
+                    emittedAtMs = 2345,
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
+            StreamCheckpoint(
+                unmappedName = stream.unmappedName,
+                unmappedNamespace = stream.unmappedNamespace,
+                blob = """{}""",
+                sourceRecordCount = 1,
+                checkpointKey = checkpointKeyForMedium(),
+            ),
+            syncEndBehavior = UncleanSyncEndBehavior.TERMINATE_WITH_NO_STREAM_STATUS,
+        )
+        dumpAndDiffRecords(
+            parsedConfig,
+            listOfNotNull(
+                // first record is still present
+                OutputRecord(
+                    extractedAt = 1234,
+                    generationId = 12,
+                    data = mapOf("id" to 42, "name" to "first_value"),
+                    airbyteMeta = OutputRecord.Meta(syncId = 42),
+                ),
+                if (commitDataIncrementally) {
+                    OutputRecord(
+                        extractedAt = 2345,
+                        generationId = 13,
+                        data = mapOf("id" to 42, "name" to "second_value"),
+                        airbyteMeta = OutputRecord.Meta(syncId = 43),
+                    )
+                } else {
+                    null
+                },
+            ),
+            finalStream,
+            primaryKey = listOf(listOf("id")),
+            cursor = null,
+        )
+
+        // finish the truncate. This should now delete the first sync's data,
+        // and definitely insert the second+third syncs' data.
+        runSync(
+            updatedConfig,
+            finalStream,
+            listOf(
+                InputRecord(
+                    stream = stream,
+                    """{"id": 42, "name": "third_value"}""",
+                    emittedAtMs = 3456,
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
+        )
+        dumpAndDiffRecords(
+            parsedConfig,
+            listOf(
+                // retain the second+third records
+                OutputRecord(
+                    extractedAt = 2345,
+                    generationId = 13,
+                    data = mapOf("id" to 42, "name" to "second_value"),
+                    airbyteMeta = OutputRecord.Meta(syncId = 43),
+                ),
+                OutputRecord(
+                    extractedAt = 3456,
+                    generationId = 13,
+                    data = mapOf("id" to 42, "name" to "third_value"),
+                    airbyteMeta = OutputRecord.Meta(syncId = 43),
+                ),
+            ),
+            finalStream,
+            primaryKey = listOf(listOf("id")),
+            cursor = null,
+        )
+    }
+
+    /**
+     * Some destinations make complicated changes based on the sync mode, e.g. Bigquery changing the
+     * table's clustering config. Verify that we can do those changes across truncates.
+     *
+     * This test validates we can finish a truncate refresh when the import type changes between
+     * runs.
+     */
+    @Test
+    open fun testTruncateRefreshChangeSyncMode() {
+        assumeTrue(verifyDataWriting)
+        assumeTrue(dedupBehavior != null)
+        val idNameSchema = ObjectType(linkedMapOf("id" to intType, "name" to stringType))
+        fun makeStream(
+            generationId: Long,
+            minimumGenerationId: Long,
+            syncId: Long,
+            importType: ImportType,
+        ) =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = generationId,
+                minimumGenerationId = minimumGenerationId,
+                syncId = syncId,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idNameSchema, importType),
             )
+        val stream =
+            makeStream(
+                generationId = 12,
+                minimumGenerationId = 12,
+                syncId = 42,
+                Dedupe(primaryKey = listOf(listOf("id")), cursor = emptyList()),
+            )
+        // start a truncate refresh in DEDUPE mode, but emit INCOMPLETE.
+        runSyncUntilStateAckAndExpectFailure(
+            updatedConfig,
+            stream,
+            listOf(
+                InputRecord(
+                    stream = stream,
+                    """{"id": 42, "name": "first_value"}""",
+                    emittedAtMs = 1234,
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
+            StreamCheckpoint(
+                unmappedName = stream.unmappedName,
+                unmappedNamespace = stream.unmappedNamespace,
+                blob = """{}""",
+                sourceRecordCount = 1,
+                checkpointKey = checkpointKeyForMedium(),
+            ),
+            syncEndBehavior = UncleanSyncEndBehavior.TERMINATE_WITH_NO_STREAM_STATUS,
+        )
+        dumpAndDiffRecords(
+            parsedConfig,
+            listOfNotNull(
+                if (commitDataIncrementally || commitDataIncrementallyToEmptyDestinationOnDedupe) {
+                    OutputRecord(
+                        extractedAt = 1234,
+                        generationId = 12,
+                        data = mapOf("id" to 42, "name" to "first_value"),
+                        airbyteMeta = OutputRecord.Meta(syncId = 42),
+                    )
+                } else {
+                    null
+                },
+            ),
+            stream,
+            primaryKey = listOf(listOf("id")),
+            cursor = null,
+        )
+
+        // start (and complete) a new truncate in APPEND mode.
+        // This should now delete the first sync's data, and insert the new record.
+        val finalStream =
+            makeStream(
+                generationId = 13,
+                minimumGenerationId = 13,
+                syncId = 43,
+                Append,
+            )
+        runSync(
+            updatedConfig,
+            finalStream,
+            listOf(
+                InputRecord(
+                    stream = stream,
+                    """{"id": 43, "name": "second_value"}""",
+                    emittedAtMs = 2345,
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
             listOf(
                 OutputRecord(
-                    extractedAt = 1234,
+                    extractedAt = 2345,
                     generationId = 13,
-                    data = mapOf("id" to 42, "name" to "second_value"),
+                    data = mapOf("id" to 43, "name" to "second_value"),
                     airbyteMeta = OutputRecord.Meta(syncId = 43),
-                )
+                ),
             ),
             finalStream,
             primaryKey = listOf(listOf("id")),
@@ -952,38 +2274,39 @@ abstract class BasicFunctionalityIntegrationTest(
      * Test behavior in a failed truncate refresh. Sync 1 just populates two records with ID 1 and
      * 2. The test then runs two more syncs:
      * 1. Sync 2 emits ID 1, and then fails the sync (i.e. no COMPLETE stream status). We expect the
-     * first sync's records to still exist in the destination. The new record may be visible to the
-     * data dumper, depending on the [commitDataIncrementally] parameter.
+     *    first sync's records to still exist in the destination. The new record may be visible to
+     *    the data dumper, depending on the [commitDataIncrementally] parameter.
      * 2. Sync 3 emits ID 2, and then ends the sync normally (i.e. COMPLETE stream status). After
-     * this sync, the data from the first sync should be deleted, and the data from both the second
-     * and third syncs should be visible to the data dumper.
+     *    this sync, the data from the first sync should be deleted, and the data from both the
+     *    second and third syncs should be visible to the data dumper.
      */
     @Test
     open fun testInterruptedTruncateWithPriorData() {
         assumeTrue(verifyDataWriting)
+        val interruptedTruncateSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to intType,
+                    "updated_at" to timestamptzType,
+                    "name" to stringType,
+                ),
+            )
         val stream1 =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(
-                    linkedMapOf(
-                        "id" to intType,
-                        "updated_at" to timestamptzType,
-                        "name" to stringType,
-                    )
-                ),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 41,
                 minimumGenerationId = 0,
                 syncId = 41,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(interruptedTruncateSchema, Append),
             )
         fun makeInputRecord(id: Int, updatedAt: String, extractedAt: Long) =
             InputRecord(
                 stream1,
                 """{"id": $id, "updated_at": "$updatedAt", "name": "foo_${id}_$extractedAt"}""",
                 emittedAtMs = extractedAt,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
             )
         fun makeOutputRecord(
             id: Int,
@@ -1043,17 +2366,18 @@ abstract class BasicFunctionalityIntegrationTest(
                 syncId = 42,
             )
         // Run a sync, but emit a status incomplete. This should not delete any existing data.
-        runSyncUntilStateAck(
+        runSyncUntilStateAckAndExpectFailure(
             updatedConfig,
             stream2,
             listOf(makeInputRecord(1, "2024-01-23T02:00:00Z", 200)),
             StreamCheckpoint(
-                stream2,
-                """{}""",
+                unmappedName = stream2.unmappedName,
+                unmappedNamespace = stream2.unmappedNamespace,
+                blob = """{}""",
                 sourceRecordCount = 1,
                 checkpointKey = checkpointKeyForMedium(),
             ),
-            allowGracefulShutdown = false,
+            syncEndBehavior = UncleanSyncEndBehavior.KILL,
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1082,7 +2406,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     )
                 } else {
                     null
-                }
+                },
             ),
             stream2,
             primaryKey = listOf(listOf("id")),
@@ -1132,29 +2456,30 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testInterruptedTruncateWithoutPriorData() {
         assumeTrue(verifyDataWriting)
+        val interruptedTruncateSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to intType,
+                    "updated_at" to timestamptzType,
+                    "name" to stringType,
+                ),
+            )
         val stream =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(
-                    linkedMapOf(
-                        "id" to intType,
-                        "updated_at" to timestamptzType,
-                        "name" to stringType,
-                    )
-                ),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 42,
                 minimumGenerationId = 42,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(interruptedTruncateSchema, Append),
             )
         fun makeInputRecord(id: Int, updatedAt: String, extractedAt: Long) =
             InputRecord(
                 stream,
                 """{"id": $id, "updated_at": "$updatedAt", "name": "foo_${id}_$extractedAt"}""",
                 emittedAtMs = extractedAt,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
             )
         fun makeOutputRecord(
             id: Int,
@@ -1175,21 +2500,22 @@ abstract class BasicFunctionalityIntegrationTest(
                 airbyteMeta = OutputRecord.Meta(syncId = syncId),
             )
         // Run a sync, but emit a stream status incomplete.
-        runSyncUntilStateAck(
+        runSyncUntilStateAckAndExpectFailure(
             updatedConfig,
             stream,
             listOf(makeInputRecord(1, "2024-01-23T02:00:00Z", 200)),
             StreamCheckpoint(
-                stream,
-                """{}""",
+                unmappedName = stream.unmappedName,
+                unmappedNamespace = stream.unmappedNamespace,
+                blob = """{}""",
                 sourceRecordCount = 1,
                 checkpointKey = checkpointKeyForMedium(),
             ),
-            allowGracefulShutdown = false,
+            syncEndBehavior = UncleanSyncEndBehavior.KILL,
         )
         dumpAndDiffRecords(
             parsedConfig,
-            if (commitDataIncrementallyToEmptyDestination) {
+            if (commitDataIncrementallyToEmptyDestinationOnAppend) {
                 listOf(
                     makeOutputRecord(
                         id = 1,
@@ -1197,7 +2523,7 @@ abstract class BasicFunctionalityIntegrationTest(
                         extractedAt = 200,
                         generationId = 42,
                         syncId = 42,
-                    )
+                    ),
                 )
             } else {
                 listOf()
@@ -1256,29 +2582,30 @@ abstract class BasicFunctionalityIntegrationTest(
     @Disabled("Still flaky")
     open fun resumeAfterCancelledTruncate() {
         assumeTrue(verifyDataWriting)
+        val resumeTruncateSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to intType,
+                    "updated_at" to timestamptzType,
+                    "name" to stringType,
+                ),
+            )
         val stream1 =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(
-                    linkedMapOf(
-                        "id" to intType,
-                        "updated_at" to timestamptzType,
-                        "name" to stringType,
-                    )
-                ),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 41,
                 minimumGenerationId = 0,
                 syncId = 41,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(resumeTruncateSchema, Append),
             )
         fun makeInputRecord(id: Int, updatedAt: String, extractedAt: Long) =
             InputRecord(
                 stream1,
                 """{"id": $id, "updated_at": "$updatedAt", "name": "foo_${id}_$extractedAt"}""",
                 emittedAtMs = extractedAt,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
             )
         fun makeOutputRecord(
             id: Int,
@@ -1339,17 +2666,18 @@ abstract class BasicFunctionalityIntegrationTest(
             )
         // Run a sync, but emit a stream status incomplete. This should not delete any existing
         // data.
-        runSyncUntilStateAck(
+        runSyncUntilStateAckAndExpectFailure(
             updatedConfig,
             stream2,
             listOf(makeInputRecord(1, "2024-01-23T02:00:00Z", 200)),
             StreamCheckpoint(
-                stream2,
-                """{}""",
+                unmappedName = stream2.unmappedName,
+                unmappedNamespace = stream2.unmappedNamespace,
+                blob = """{}""",
                 sourceRecordCount = 1,
                 checkpointKey = checkpointKeyForMedium(),
             ),
-            allowGracefulShutdown = false,
+            syncEndBehavior = UncleanSyncEndBehavior.KILL,
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1378,7 +2706,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     )
                 } else {
                     null
-                }
+                },
             ),
             stream2,
             primaryKey = listOf(listOf("id")),
@@ -1445,16 +2773,16 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testAppend() {
         assumeTrue(verifyDataWriting)
+        val idNameSchema = ObjectType(linkedMapOf("id" to intType, "name" to stringType))
         fun makeStream(syncId: Long) =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(linkedMapOf("id" to intType, "name" to stringType)),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 0,
                 minimumGenerationId = 0,
-                syncId,
-                namespaceMapper = namespaceMapperForMedium()
+                syncId = syncId,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idNameSchema, Append),
             )
         val stream = makeStream(syncId = 42)
         runSync(
@@ -1465,9 +2793,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream,
                     """{"id": 42, "name": "first_value"}""",
                     emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         val finalStream = makeStream(syncId = 43)
         runSync(
@@ -1478,9 +2806,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     finalStream,
                     """{"id": 42, "name": "second_value"}""",
                     emittedAtMs = 5678L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1496,7 +2824,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     generationId = 0,
                     data = mapOf("id" to 42, "name" to "second_value"),
                     airbyteMeta = OutputRecord.Meta(syncId = 43),
-                )
+                ),
             ),
             finalStream,
             primaryKey = listOf(listOf("id")),
@@ -1506,8 +2834,9 @@ abstract class BasicFunctionalityIntegrationTest(
 
     /**
      * Intended to test for basic schema evolution. Runs two append syncs, where the second sync has
-     * a few changes
-     * * drop the `to_drop` column
+     * a few changes:
+     * * remove the `to_drop` column from the schema (dropped or retained based on
+     *   [columnDropBehavior])
      * * add a `to_add` column
      * * change the `to_change` column from int to string
      */
@@ -1517,19 +2846,18 @@ abstract class BasicFunctionalityIntegrationTest(
         assumeTrue(isStreamSchemaRetroactive)
         fun makeStream(syncId: Long, schema: LinkedHashMap<String, FieldType>) =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(schema),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 0,
                 minimumGenerationId = 0,
-                syncId,
-                namespaceMapper = namespaceMapperForMedium()
+                syncId = syncId,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(schema), Append),
             )
         val stream =
             makeStream(
                 syncId = 42,
-                linkedMapOf("id" to intType, "to_drop" to stringType, "to_change" to intType)
+                linkedMapOf("id" to intType, "to_drop" to stringType, "to_change" to intType),
             )
         runSync(
             updatedConfig,
@@ -1539,14 +2867,14 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream,
                     """{"id": 42, "to_drop": "val1", "to_change": 42}""",
                     emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         val finalStream =
             makeStream(
                 syncId = 43,
-                linkedMapOf("id" to intType, "to_change" to stringType, "to_add" to stringType)
+                linkedMapOf("id" to intType, "to_change" to stringType, "to_add" to stringType),
             )
         runSync(
             updatedConfig,
@@ -1556,9 +2884,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     finalStream,
                     """{"id": 42, "to_change": "val2", "to_add": "val3"}""",
                     emittedAtMs = 2345,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1566,9 +2894,15 @@ abstract class BasicFunctionalityIntegrationTest(
                 OutputRecord(
                     extractedAt = 1234,
                     generationId = 0,
-                    // the first sync's record has to_change modified to a string,
-                    // and to_drop is gone completely
-                    data = mapOf("id" to 42, "to_change" to "42"),
+                    // the first sync's record has to_change modified to a string.
+                    // to_drop is gone if the destination drops columns, or retained
+                    // if the destination keeps columns during schema evolution.
+                    data =
+                        if (columnDropBehavior == ColumnDropBehavior.DROP) {
+                            mapOf("id" to 42, "to_change" to "42")
+                        } else {
+                            mapOf("id" to 42, "to_drop" to "val1", "to_change" to "42")
+                        },
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
                 OutputRecord(
@@ -1576,7 +2910,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     generationId = 0,
                     data = mapOf("id" to 42, "to_change" to "val2", "to_add" to "val3"),
                     airbyteMeta = OutputRecord.Meta(syncId = 43),
-                )
+                ),
             ),
             finalStream,
             primaryKey = listOf(listOf("id")),
@@ -1596,14 +2930,13 @@ abstract class BasicFunctionalityIntegrationTest(
         assumeTrue(isStreamSchemaRetroactiveForUnknownTypeToString)
         fun makeStream(schema: LinkedHashMap<String, FieldType>) =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(schema),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 0,
                 minimumGenerationId = 0,
                 syncId = 0,
                 namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(schema), Append),
             )
 
         val stream1 =
@@ -1631,8 +2964,8 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream2,
                     """{"id": 43, "a": "foo2", "b": "bar2"}""",
                     emittedAtMs = 200,
-                )
-            )
+                ),
+            ),
         )
 
         dumpAndDiffRecords(
@@ -1651,7 +2984,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     generationId = 0,
                     data = mapOf("id" to 43, "a" to "foo2", "b" to "bar2"),
                     airbyteMeta = OutputRecord.Meta(syncId = 0),
-                )
+                ),
             ),
             stream2,
             primaryKey = listOf(listOf("id")),
@@ -1675,14 +3008,13 @@ abstract class BasicFunctionalityIntegrationTest(
             minimumGenerationId: Long,
         ) =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(schema),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = generationId,
                 minimumGenerationId = minimumGenerationId,
-                syncId,
-                namespaceMapper = namespaceMapperForMedium()
+                syncId = syncId,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(ObjectType(schema), Append),
             )
         val stream =
             makeStream(
@@ -1699,9 +3031,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream,
                     """{"id": 42, "to_drop": "val1", "to_change": 42}""",
                     emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         val changedStream =
             makeStream(
@@ -1718,9 +3050,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     changedStream,
                     """{"id": 42, "to_change": "val2", "to_add": "val3"}""",
                     emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1730,12 +3062,12 @@ abstract class BasicFunctionalityIntegrationTest(
                     generationId = 2,
                     data = mapOf("id" to 42, "to_change" to "val2", "to_add" to "val3"),
                     airbyteMeta = OutputRecord.Meta(syncId = 43),
-                )
+                ),
             ),
             changedStream,
             primaryKey = listOf(listOf("id")),
             cursor = null,
-            reason = "Records were incorrect when trying to change the schema."
+            reason = "Records were incorrect when trying to change the schema.",
         )
 
         // Run a third sync, to verify that the schema is stable after evolution
@@ -1750,9 +3082,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     finalStream,
                     """{"id": 42, "to_change": "val4", "to_add": "val5"}""",
                     emittedAtMs = 5678L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1773,7 +3105,7 @@ abstract class BasicFunctionalityIntegrationTest(
             finalStream,
             primaryKey = listOf(listOf("id")),
             cursor = null,
-            reason = "Records were incorrect after running a second sync with the updated schema."
+            reason = "Records were incorrect after running a second sync with the updated schema.",
         )
     }
 
@@ -1783,30 +3115,31 @@ abstract class BasicFunctionalityIntegrationTest(
     ) {
         assumeTrue(verifyDataWriting)
         assumeTrue(dedupBehavior != null)
+        val dedupImportType =
+            Dedupe(
+                primaryKey = listOf(listOf("id1"), listOf("id2")),
+                cursor = listOf("updated_at"),
+            )
+        val dedupSchema =
+            ObjectType(
+                properties =
+                    linkedMapOf(
+                        "id1" to FieldType(idType, nullable = false),
+                        "id2" to intType,
+                        "updated_at" to timestamptzType,
+                        "name" to stringType,
+                        "_ab_cdc_deleted_at" to timestamptzType,
+                    ),
+            )
         fun makeStream(syncId: Long) =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "test_stream",
-                importType =
-                    Dedupe(
-                        primaryKey = listOf(listOf("id1"), listOf("id2")),
-                        cursor = listOf("updated_at"),
-                    ),
-                schema =
-                    ObjectType(
-                        properties =
-                            linkedMapOf(
-                                "id1" to FieldType(idType, nullable = false),
-                                "id2" to intType,
-                                "updated_at" to timestamptzType,
-                                "name" to stringType,
-                                "_ab_cdc_deleted_at" to timestamptzType,
-                            )
-                    ),
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = syncId,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(dedupSchema, dedupImportType),
             )
         val sync1Stream = makeStream(syncId = 42)
         fun makeRecord(data: String, extractedAt: Long) =
@@ -1814,7 +3147,7 @@ abstract class BasicFunctionalityIntegrationTest(
                 sync1Stream,
                 data,
                 emittedAtMs = extractedAt,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
             )
         runSync(
             updatedConfig,
@@ -1840,6 +3173,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     extractedAt = 1000,
                 ),
             ),
+            useSingleSocket = useSingleSocketForDedup,
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -1854,7 +3188,7 @@ abstract class BasicFunctionalityIntegrationTest(
                             "id2" to 200,
                             "updated_at" to TimestampWithTimezoneValue("2000-01-01T00:01:00Z"),
                             "name" to "Alice2",
-                            "_ab_cdc_deleted_at" to null
+                            "_ab_cdc_deleted_at" to null,
                         ),
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
@@ -1866,7 +3200,7 @@ abstract class BasicFunctionalityIntegrationTest(
                             "id1" to idValue,
                             "id2" to 201,
                             "updated_at" to TimestampWithTimezoneValue("2000-01-01T00:02:00Z"),
-                            "name" to "Bob1"
+                            "name" to "Bob1",
                         ),
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
@@ -1913,6 +3247,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     extractedAt = 2000,
                 ),
             ),
+            useSingleSocket = useSingleSocketForDedup,
         )
         val deletedRecords =
             when (dedupBehavior!!.cdcDeletionMode) {
@@ -1981,10 +3316,10 @@ abstract class BasicFunctionalityIntegrationTest(
                             "id2" to 200,
                             "updated_at" to TimestampWithTimezoneValue("2000-01-02T00:00:00Z"),
                             "name" to "Alice3",
-                            "_ab_cdc_deleted_at" to null
+                            "_ab_cdc_deleted_at" to null,
                         ),
                     airbyteMeta = OutputRecord.Meta(syncId = 43),
-                )
+                ),
             ) + deletedRecords,
             sync2Stream,
             primaryKey = listOf(listOf("id1"), listOf("id2")),
@@ -2005,16 +3340,17 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testDedupNoCursor() {
         assumeTrue(verifyDataWriting && dedupBehavior != null)
+        val noCursorImportType = Dedupe(primaryKey = listOf(listOf("id")), cursor = emptyList())
+        val noCursorSchema = ObjectType(linkedMapOf("id" to intType, "name" to stringType))
         val stream =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "test_stream",
-                Dedupe(primaryKey = listOf(listOf("id")), cursor = emptyList()),
-                ObjectType(linkedMapOf("id" to intType, "name" to stringType)),
                 generationId = 0,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(noCursorSchema, noCursorImportType),
             )
         runSync(
             updatedConfig,
@@ -2024,7 +3360,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream,
                     data = """{"id": 1234, "name": "a"}""",
                     emittedAtMs = 1234,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
             ),
         )
@@ -2036,7 +3372,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream,
                     data = """{"id": 1234, "name": "b"}""",
                     emittedAtMs = 5678,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
             ),
         )
@@ -2067,42 +3403,45 @@ abstract class BasicFunctionalityIntegrationTest(
     open fun testDedupChangeCursor() {
         assumeTrue(verifyDataWriting)
         assumeTrue(dedupBehavior != null)
-        fun makeStream(cursor: String) =
-            DestinationStream(
-                unmappedNamespace = randomizedNamespace,
-                unmappedName = "test_stream",
+        fun makeStream(cursor: String): DestinationStream {
+            val importType =
                 Dedupe(
                     primaryKey = listOf(listOf("id")),
                     cursor = listOf(cursor),
-                ),
-                schema =
-                    ObjectType(
-                        linkedMapOf(
-                            "id" to intType,
-                            cursor to intType,
-                            "name" to stringType,
-                        )
+                )
+            val schema =
+                ObjectType(
+                    linkedMapOf(
+                        "id" to intType,
+                        cursor to intType,
+                        "name" to stringType,
                     ),
+                )
+            return DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(schema, importType),
             )
+        }
         val stream1 = makeStream("cursor1")
-        fun makeRecord(cursorName: String, emittedAtMs: Long) =
+        fun makeRecord(stream: DestinationStream, cursorName: String, emittedAtMs: Long) =
             InputRecord(
-                stream1,
+                stream,
                 data = """{"id": 1, "$cursorName": 1, "name": "foo_$cursorName"}""",
                 emittedAtMs = emittedAtMs,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
             )
         runSync(
             updatedConfig,
             stream1,
-            listOf(makeRecord("cursor1", emittedAtMs = 100)),
+            listOf(makeRecord(stream1, "cursor1", emittedAtMs = 100)),
         )
         val stream2 = makeStream("cursor2")
-        runSync(updatedConfig, stream2, listOf(makeRecord("cursor2", emittedAtMs = 200)))
+        runSync(updatedConfig, stream2, listOf(makeRecord(stream2, "cursor2", emittedAtMs = 200)))
         dumpAndDiffRecords(
             parsedConfig,
             listOf(
@@ -2110,13 +3449,22 @@ abstract class BasicFunctionalityIntegrationTest(
                     extractedAt = 200,
                     generationId = 42,
                     data =
-                        mapOf(
-                            "id" to 1,
-                            "cursor2" to 1,
-                            "name" to "foo_cursor2",
-                        ),
+                        if (columnDropBehavior == ColumnDropBehavior.DROP) {
+                            mapOf(
+                                "id" to 1,
+                                "cursor2" to 1,
+                                "name" to "foo_cursor2",
+                            )
+                        } else {
+                            mapOf(
+                                "id" to 1,
+                                "cursor1" to 1,
+                                "cursor2" to 1,
+                                "name" to "foo_cursor2",
+                            )
+                        },
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
-                )
+                ),
             ),
             stream2,
             primaryKey = listOf(listOf("id")),
@@ -2137,29 +3485,32 @@ abstract class BasicFunctionalityIntegrationTest(
     open fun testDedupChangePk() {
         assumeTrue(verifyDataWriting)
         assumeTrue(dedupBehavior != null)
-        fun makeStream(secondPk: String) =
-            DestinationStream(
-                randomizedNamespace,
-                "test_stream",
+        val changePkSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id1" to intType,
+                    "id2" to intType,
+                    "id3" to intType,
+                    "updated_at" to intType,
+                    "name" to stringType,
+                ),
+            )
+        fun makeStream(secondPk: String): DestinationStream {
+            val importType =
                 Dedupe(
                     primaryKey = listOf(listOf("id1"), listOf(secondPk)),
                     cursor = listOf("updated_at"),
-                ),
-                schema =
-                    ObjectType(
-                        linkedMapOf(
-                            "id1" to intType,
-                            "id2" to intType,
-                            "id3" to intType,
-                            "updated_at" to intType,
-                            "name" to stringType,
-                        )
-                    ),
+                )
+            return DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
                 namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(changePkSchema, importType),
             )
+        }
         fun makeRecord(stream: DestinationStream, secondPk: String, emittedAtMs: Long) =
             InputRecord(
                 stream,
@@ -2178,7 +3529,7 @@ abstract class BasicFunctionalityIntegrationTest(
         runSync(
             updatedConfig,
             stream2,
-            listOf(makeRecord(stream2, secondPk = "id3", emittedAtMs = 200))
+            listOf(makeRecord(stream2, secondPk = "id3", emittedAtMs = 200)),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -2192,7 +3543,7 @@ abstract class BasicFunctionalityIntegrationTest(
                             "id2" to 200,
                             "updated_at" to 1,
                             "name" to "foo_100",
-                        ),
+                        ) + if (dedupChangeUsesDefault) mapOf("id3" to 0) else emptyMap(),
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
                 OutputRecord(
@@ -2228,17 +3579,17 @@ abstract class BasicFunctionalityIntegrationTest(
             manyStreamCount > 1,
             "manyStreamCount should be greater than 1. If you want to disable this test, just override it and use @Disabled.",
         )
+        val manyStreamsSchema = ObjectType(linkedMapOf("id" to intType, "name" to stringType))
         val streams =
             (0..manyStreamCount).map { i ->
                 DestinationStream(
                     unmappedNamespace = randomizedNamespace,
                     unmappedName = "test_stream_$i",
-                    Append,
-                    ObjectType(linkedMapOf("id" to intType, "name" to stringType)),
                     generationId = 42,
                     minimumGenerationId = 42,
                     syncId = 42,
-                    namespaceMapper = namespaceMapperForMedium()
+                    namespaceMapper = namespaceMapperForMedium(),
+                    tableSchema = makeTableSchema(manyStreamsSchema, Append),
                 )
             }
         val messages =
@@ -2247,7 +3598,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     streams[i],
                     """{"id": 1, "name": "foo_$i"}""",
                     emittedAtMs = 100,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 )
             }
         // Just verify that we don't crash.
@@ -2265,45 +3616,42 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testBasicTypes() {
         assumeTrue(verifyDataWriting)
+        val basicTypesSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to intType,
+                    // Some destinations handle numbers differently in root and nested fields
+                    "struct" to
+                        FieldType(ObjectType(linkedMapOf("foo" to numberType)), nullable = true),
+                    "string" to FieldType(StringType, nullable = true),
+                    "number" to FieldType(NumberType, nullable = true),
+                    "integer" to FieldType(IntegerType, nullable = true),
+                    "boolean" to FieldType(BooleanType, nullable = true),
+                    "timestamp_with_timezone" to
+                        FieldType(TimestampTypeWithTimezone, nullable = true),
+                    "timestamp_without_timezone" to
+                        FieldType(TimestampTypeWithoutTimezone, nullable = true),
+                    "time_with_timezone" to FieldType(TimeTypeWithTimezone, nullable = true),
+                    "time_without_timezone" to FieldType(TimeTypeWithoutTimezone, nullable = true),
+                    "date" to FieldType(DateType, nullable = true),
+                ),
+            )
         val stream =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "test_stream",
-                Append,
-                ObjectType(
-                    linkedMapOf(
-                        "id" to intType,
-                        // Some destinations handle numbers differently in root and nested fields
-                        "struct" to
-                            FieldType(
-                                ObjectType(linkedMapOf("foo" to numberType)),
-                                nullable = true
-                            ),
-                        "string" to FieldType(StringType, nullable = true),
-                        "number" to FieldType(NumberType, nullable = true),
-                        "integer" to FieldType(IntegerType, nullable = true),
-                        "boolean" to FieldType(BooleanType, nullable = true),
-                        "timestamp_with_timezone" to
-                            FieldType(TimestampTypeWithTimezone, nullable = true),
-                        "timestamp_without_timezone" to
-                            FieldType(TimestampTypeWithoutTimezone, nullable = true),
-                        "time_with_timezone" to FieldType(TimeTypeWithTimezone, nullable = true),
-                        "time_without_timezone" to
-                            FieldType(TimeTypeWithoutTimezone, nullable = true),
-                        "date" to FieldType(DateType, nullable = true),
-                    )
-                ),
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(basicTypesSchema, Append),
             )
         fun makeRecord(data: String) =
             InputRecord(
                 stream,
                 data,
                 emittedAtMs = 100,
-                checkpointId = checkpointKeyForMedium()?.checkpointId
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
             )
         runSync(
             updatedConfig,
@@ -2312,72 +3660,74 @@ abstract class BasicFunctionalityIntegrationTest(
                 // A record with valid values for all fields
                 makeRecord(
                     """
-                        {
-                          "id": 1,
-                          "string": "foo",
-                          "number": 42.1,
-                          "integer": 42,
-                          "boolean": true,
-                          "timestamp_with_timezone": "2023-01-23T11:34:56-01:00",
-                          "timestamp_without_timezone": "2023-01-23T12:34:56",
-                          "time_with_timezone": "11:34:56-01:00",
-                          "time_without_timezone": "12:34:56",
-                          "date": "2023-01-23"
-                        }
-                    """.trimIndent()
+                    {
+                      "id": 1,
+                      "string": "fo\u0000o",
+                      "number": 42.1,
+                      "integer": 42,
+                      "boolean": true,
+                      "timestamp_with_timezone": "2023-01-23T11:34:56-01:00",
+                      "timestamp_without_timezone": "2023-01-23T12:34:56",
+                      "time_with_timezone": "11:34:56-01:00",
+                      "time_without_timezone": "12:34:56",
+                      "date": "2023-01-23"
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 // A record with null for all fields
                 makeRecord(
                     """
-                        {
-                          "id": 2,
-                          "string": null,
-                          "number": null,
-                          "integer": null,
-                          "boolean": null,
-                          "timestamp_with_timezone": null,
-                          "timestamp_without_timezone": null,
-                          "time_with_timezone": null,
-                          "time_without_timezone": null,
-                          "date": null
-                        }
-                    """.trimIndent()
+                    {
+                      "id": 2,
+                      "string": null,
+                      "number": null,
+                      "integer": null,
+                      "boolean": null,
+                      "timestamp_with_timezone": null,
+                      "timestamp_without_timezone": null,
+                      "time_with_timezone": null,
+                      "time_without_timezone": null,
+                      "date": null
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 // A record with all fields unset
                 makeRecord("""{"id": 3}"""),
                 // A record that verifies numeric behavior.
                 // 99999999999999999999999999999999 is out of range for int64.
-                // 50000.0000000000000001 can't be represented as a standard float64,
                 // and gets rounded off.
                 // 1e39 is greater than the typical max 1e39-1 for database/warehouse destinations
                 // (decimal points are to force jackson to recognize it as a decimal)
                 makeRecord(
                     """
-                        {
-                          "id": 4,
-                          "struct": {"foo": 50000.0000000000000001},
-                          "number": 50000.0000000000000001,
-                          "integer": 99999999999999999999999999999999,
-                          "number": 1.0000000000000000000000000000000000000000e39
-                        }
-                    """.trimIndent(),
+                    {
+                      "id": 4,
+                      "struct": {"foo": 50000.0000000000000001},
+                      "integer": 99999999999999999999999999999999,
+                      "number": 1.0000000000000000000000000000000000000000e39
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 // A record with invalid values for all fields
                 makeRecord(
                     """
-                        {
-                          "id": 5,
-                          "string": {},
-                          "number": "foo",
-                          "integer": "foo",
-                          "boolean": "foo",
-                          "timestamp_with_timezone": "foo",
-                          "timestamp_without_timezone": "foo",
-                          "time_with_timezone": "foo",
-                          "time_without_timezone": "foo",
-                          "date": "foo"
-                        }
-                    """.trimIndent()
+                    {
+                      "id": 5,
+                      "string": {},
+                      "number": "foo",
+                      "integer": "foo",
+                      "boolean": "foo",
+                      "timestamp_with_timezone": "foo",
+                      "timestamp_without_timezone": "foo",
+                      "time_with_timezone": "foo",
+                      "time_without_timezone": "foo",
+                      "date": "foo"
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 // Another record that verifies numeric behavior.
                 // -99999999999999999999999999999999 is out of range for int64.
@@ -2385,26 +3735,28 @@ abstract class BasicFunctionalityIntegrationTest(
                 // where the maximum precision of a numeric type is 38.
                 makeRecord(
                     """
-                        {
-                          "id": 6,
-                          "number": -2.0000000000000000000000000000000000000000e39,
-                          "integer": -99999999999999999999999999999999
-                        }
-                    """.trimIndent(),
+                    {
+                      "id": 6,
+                      "number": -2.0000000000000000000000000000000000000000e39,
+                      "integer": -99999999999999999999999999999999
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 // A record with truncated timestamps (i.e. the seconds value is 0).
                 // Some destinations have specific formatting requirements, and it's easy
                 // to mess these values up.
                 makeRecord(
                     """
-                        {
-                          "id": 7,
-                          "timestamp_with_timezone": "2023-01-23T11:34:00-01:00",
-                          "timestamp_without_timezone": "2023-01-23T12:34:00",
-                          "time_with_timezone": "11:34:00-01:00",
-                          "time_without_timezone": "12:34:00"
-                        }
-                    """.trimIndent()
+                    {
+                      "id": 7,
+                      "timestamp_with_timezone": "2023-01-23T11:34:00-01:00",
+                      "timestamp_without_timezone": "2023-01-23T12:34:00",
+                      "time_with_timezone": "11:34:00-01:00",
+                      "time_without_timezone": "12:34:00"
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 // lol, more numbers
                 // it's surprisingly easy to handle zero / negative numbers wrong
@@ -2412,21 +3764,23 @@ abstract class BasicFunctionalityIntegrationTest(
                 // and should instead do `value < -Double.MAX_VALUE`
                 makeRecord(
                     """
-                        {
-                          "id": 8,
-                          "integer": 0,
-                          "number": 0.0
-                        }
-                    """.trimIndent(),
+                    {
+                      "id": 8,
+                      "integer": 0,
+                      "number": 0.0
+                    }
+                    """
+                        .trimIndent(),
                 ),
                 makeRecord(
                     """
-                        {
-                          "id": 9,
-                          "integer": -1,
-                          "number": -1.0
-                        }
-                    """.trimIndent(),
+                    {
+                      "id": 9,
+                      "integer": -1,
+                      "number": -1.0
+                    }
+                    """
+                        .trimIndent(),
                 ),
             ),
         )
@@ -2472,7 +3826,7 @@ abstract class BasicFunctionalityIntegrationTest(
                                 AirbyteRecordMessageMetaChange.Change.NULLED,
                                 AirbyteRecordMessageMetaChange.Reason
                                     .DESTINATION_FIELD_SIZE_LIMITATION,
-                            )
+                            ),
                         )
                     }
                 if (allTypesBehavior.numberCanBeLarge) {
@@ -2492,14 +3846,17 @@ abstract class BasicFunctionalityIntegrationTest(
                                 AirbyteRecordMessageMetaChange.Change.NULLED,
                                 AirbyteRecordMessageMetaChange.Reason
                                     .DESTINATION_FIELD_SIZE_LIMITATION,
-                            )
+                            ),
                         )
                     }
                 badValuesData =
                     mapOf(
                         "id" to 5,
                         "string" to
-                            if (allTypesBehavior.convertAllValuesToString) {
+                            if (
+                                allTypesBehavior.convertAllValuesToString &&
+                                    dataChannelFormat != DataChannelFormat.PROTOBUF
+                            ) {
                                 "{}"
                             } else {
                                 null
@@ -2518,13 +3875,39 @@ abstract class BasicFunctionalityIntegrationTest(
                         "date" to null,
                     )
                 badValuesChanges =
-                    (stream.schema as ObjectType)
-                        .properties
-                        .keys
+                    basicTypesSchema.properties.keys
                         .asSequence()
                         // id and struct don't have a bad value case here
                         // (id would make the test unusable; struct is tested in testContainerTypes)
                         .filter { it != "id" && it != "struct" }
+                        .filter {
+                            it != "boolean" || dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
+                        .filter {
+                            it != "integer" || dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
+                        .filter {
+                            it != "number" || dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
+                        // With protobuf, temporal types are encoded as proper types (not strings),
+                        // so it's impossible to send invalid values like "foo"
+                        .filter { it != "date" || dataChannelFormat != DataChannelFormat.PROTOBUF }
+                        .filter {
+                            it != "time_with_timezone" ||
+                                dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
+                        .filter {
+                            it != "time_without_timezone" ||
+                                dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
+                        .filter {
+                            it != "timestamp_with_timezone" ||
+                                dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
+                        .filter {
+                            it != "timestamp_without_timezone" ||
+                                dataChannelFormat != DataChannelFormat.PROTOBUF
+                        }
                         .map { key ->
                             val change =
                                 Change(
@@ -2558,21 +3941,32 @@ abstract class BasicFunctionalityIntegrationTest(
                 bigNumberChanges = emptyList()
                 badValuesData =
                     // note that the values have different types than what's declared in the schema
-                    mapOf(
-                        "id" to 5,
-                        "timestamp_with_timezone" to "foo",
-                        "timestamp_without_timezone" to "foo",
-                        "time_with_timezone" to "foo",
-                        "time_without_timezone" to "foo",
-                        "date" to "foo",
-                    ) +
+                    // With protobuf, temporal types can't be sent as strings, so exclude them
+                    (mapOf("id" to 5) +
+                        if (dataChannelFormat != DataChannelFormat.PROTOBUF) {
+                            mapOf(
+                                "timestamp_with_timezone" to "foo",
+                                "timestamp_without_timezone" to "foo",
+                                "time_with_timezone" to "foo",
+                                "time_without_timezone" to "foo",
+                                "date" to "foo",
+                            )
+                        } else {
+                            mapOf(
+                                "timestamp_with_timezone" to null,
+                                "timestamp_without_timezone" to null,
+                                "time_with_timezone" to null,
+                                "time_without_timezone" to null,
+                                "date" to null,
+                            )
+                        }) +
                         if (mismatchedTypesUnrepresentable) emptyMap()
                         else
                             mapOf(
                                 "string" to ObjectValue(linkedMapOf()),
                                 "number" to "foo",
                                 "integer" to "foo",
-                                "boolean" to "foo"
+                                "boolean" to "foo",
                             )
                 badValuesChanges = mutableListOf()
             }
@@ -2586,7 +3980,7 @@ abstract class BasicFunctionalityIntegrationTest(
                     data =
                         mapOf(
                             "id" to 1,
-                            "string" to "foo",
+                            "string" to "fo\u0000o",
                             "number" to 42.1,
                             "integer" to 42,
                             "boolean" to true,
@@ -2709,6 +4103,165 @@ abstract class BasicFunctionalityIntegrationTest(
     }
 
     /**
+     * Further tests for number/int types. For historical reasons, some of the records in
+     * [testBasicTypes] also cover numerics.
+     */
+    @Test
+    open fun testNumericTypes() {
+        assumeTrue(verifyDataWriting)
+        assumeTrue(allTypesBehavior is StronglyTyped)
+        // TODO ideally we would have some more flexibility here, but it's kind of painful to
+        //   configure our tests already.
+        assumeTrue((allTypesBehavior as StronglyTyped).numberIsFixedPointPrecision38Scale9)
+        val numericTypesSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to intType,
+                    "number" to FieldType(NumberType, nullable = true),
+                    "integer" to FieldType(IntegerType, nullable = true),
+                ),
+            )
+        val stream =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = 42,
+                minimumGenerationId = 0,
+                syncId = 42,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(numericTypesSchema, Append),
+            )
+        fun makeRecord(data: String) =
+            InputRecord(
+                stream,
+                data,
+                emittedAtMs = 100,
+                checkpointId = checkpointKeyForMedium()?.checkpointId,
+            )
+        // large numbers, 0, and -1 are already tested in testBasicTypes, but add them here also.
+        // Eventually we should remove them from testBasicTypes, but that would require a less dumb
+        // test config system.
+        val roundingModeTest = "5e-10"
+        val highPrecisionTest = "12345678912345678912345678912.3456789123"
+        runSync(
+            updatedConfig,
+            stream,
+            listOf(
+                // Test that we can handle numbers which require scale=10.
+                // Depending on destination behavior, these should either be
+                // truncated to 0, or rounded to +/-1e9
+                makeRecord(
+                    """
+                        {
+                          "id": 1,
+                          "number": $roundingModeTest
+                        }
+                    """
+                        .trimIndent(),
+                ),
+                makeRecord(
+                    """
+                        {
+                          "id": 2,
+                          "number": -$roundingModeTest
+                        }
+                    """
+                        .trimIndent(),
+                ),
+                // Similarly, test that we can handle numbers with precision=39,
+                // but that still fit within a (38, 9) field's min/max values.
+                makeRecord(
+                    """
+                        {
+                          "id": 3,
+                          "number": $highPrecisionTest
+                        }
+                    """
+                        .trimIndent(),
+                ),
+                makeRecord(
+                    """
+                        {
+                          "id": 4,
+                          "number": -$highPrecisionTest
+                        }
+                    """
+                        .trimIndent(),
+                ),
+            ),
+        )
+        val roundingModeExpectedValue =
+            BigDecimal(roundingModeTest).setScale(9, allTypesBehavior.truncatedNumberRoundingMode)
+        val highPrecisionExpectedValue =
+            BigDecimal(highPrecisionTest).setScale(9, allTypesBehavior.truncatedNumberRoundingMode)
+        val meta =
+            OutputRecord.Meta(
+                syncId = 42,
+                changes =
+                    listOfNotNull(
+                        if (allTypesBehavior.truncatedNumbersPopulateAirbyteMeta) {
+                            Change(
+                                "number",
+                                AirbyteRecordMessageMetaChange.Change.TRUNCATED,
+                                AirbyteRecordMessageMetaChange.Reason
+                                    .DESTINATION_FIELD_SIZE_LIMITATION,
+                            )
+                        } else {
+                            null
+                        },
+                    ),
+            )
+        dumpAndDiffRecords(
+            parsedConfig,
+            listOf(
+                OutputRecord(
+                    extractedAt = 100,
+                    generationId = 42,
+                    data =
+                        mapOf(
+                            "id" to 1,
+                            "number" to roundingModeExpectedValue,
+                        ),
+                    airbyteMeta = meta,
+                ),
+                OutputRecord(
+                    extractedAt = 100,
+                    generationId = 42,
+                    data =
+                        mapOf(
+                            "id" to 2,
+                            "number" to roundingModeExpectedValue.negate(),
+                        ),
+                    airbyteMeta = meta,
+                ),
+                OutputRecord(
+                    extractedAt = 100,
+                    generationId = 42,
+                    data =
+                        mapOf(
+                            "id" to 3,
+                            "number" to highPrecisionExpectedValue,
+                        ),
+                    airbyteMeta = meta,
+                ),
+                OutputRecord(
+                    extractedAt = 100,
+                    generationId = 42,
+                    data =
+                        mapOf(
+                            "id" to 4,
+                            "number" to highPrecisionExpectedValue.negate(),
+                        ),
+                    airbyteMeta = meta,
+                ),
+            ),
+            stream,
+            primaryKey = listOf(listOf("id")),
+            cursor = null,
+        )
+    }
+
+    /**
      * Some types (object/array) are expected to contain other types. Verify that we handle them
      * correctly.
      *
@@ -2720,34 +4273,35 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testContainerTypes() {
         assumeTrue(verifyDataWriting)
+        val containerTypesSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to FieldType(IntegerType, nullable = true),
+                    "schematized_object" to
+                        FieldType(
+                            ObjectType(
+                                linkedMapOf(
+                                    "id" to FieldType(IntegerType, nullable = true),
+                                    "name" to FieldType(StringType, nullable = true),
+                                ),
+                            ),
+                            nullable = true,
+                        ),
+                    "empty_object" to FieldType(ObjectTypeWithEmptySchema, nullable = true),
+                    "schemaless_object" to FieldType(ObjectTypeWithoutSchema, nullable = true),
+                    "schematized_array" to FieldType(ArrayType(intType), nullable = true),
+                    "schemaless_array" to FieldType(ArrayTypeWithoutSchema, nullable = true),
+                ),
+            )
         val stream =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "problematic_types",
-                Append,
-                ObjectType(
-                    linkedMapOf(
-                        "id" to FieldType(IntegerType, nullable = true),
-                        "schematized_object" to
-                            FieldType(
-                                ObjectType(
-                                    linkedMapOf(
-                                        "id" to FieldType(IntegerType, nullable = true),
-                                        "name" to FieldType(StringType, nullable = true),
-                                    )
-                                ),
-                                nullable = true,
-                            ),
-                        "empty_object" to FieldType(ObjectTypeWithEmptySchema, nullable = true),
-                        "schemaless_object" to FieldType(ObjectTypeWithoutSchema, nullable = true),
-                        "schematized_array" to FieldType(ArrayType(intType), nullable = true),
-                        "schemaless_array" to FieldType(ArrayTypeWithoutSchema, nullable = true),
-                    ),
-                ),
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(containerTypesSchema, Append),
             )
         runSync(
             updatedConfig,
@@ -2756,46 +4310,52 @@ abstract class BasicFunctionalityIntegrationTest(
                 InputRecord(
                     stream,
                     """
-                        {
-                          "id": 1,
-                          "schematized_object": { "id": 1, "name": "Joe", "undeclared": 42 },
-                          "empty_object": {},
-                          "schemaless_object": { "uuid": "38F52396-736D-4B23-B5B4-F504D8894B97", "probability": 1.5 },
-                          "schematized_array": [10, null],
-                          "schemaless_array": [ 10, "foo", null, { "bar": "qua" } ]
-                        }""".trimIndent(),
+                    {
+                      "id": 1,
+                      "schematized_object": { "id": 1, "name": "Joe", "undeclared": 42 },
+                      "empty_object": {},
+                      "schemaless_object": { "uuid": "38F52396-736D-4B23-B5B4-F504D8894B97", "probability": 1.5 },
+                      "schematized_array": [10, null],
+                      "schemaless_array": [ 10, "foo", null, { "bar": "qua" } ]
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1602637589100,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
                 InputRecord(
                     stream,
                     """
-                        {
-                          "id": 2,
-                          "schematized_object": { "id": 2, "name": "Jane" },
-                          "empty_object": {"extra": "stuff"},
-                          "schemaless_object": { "address": { "street": "113 Hickey Rd", "zip": "37932" }, "flags": [ true, false, false ] },
-                          "schematized_array": [],
-                          "schemaless_array": []
-                        }""".trimIndent(),
+                    {
+                      "id": 2,
+                      "schematized_object": { "id": 2, "name": "Jane" },
+                      "empty_object": {"extra": "stuff"},
+                      "schemaless_object": { "address": { "street": "113 Hickey Rd", "zip": "37932" }, "flags": [ true, false, false ] },
+                      "schematized_array": [],
+                      "schemaless_array": []
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1602637589200,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
                 InputRecord(
                     stream,
                     """
-                        {
-                          "id": 3,
-                          "schematized_object": null,
-                          "empty_object": null,
-                          "schemaless_object": null,
-                          "schematized_array": null,
-                          "schemaless_array": null
-                        }""".trimIndent(),
+                    {
+                      "id": 3,
+                      "schematized_object": null,
+                      "empty_object": null,
+                      "schemaless_object": null,
+                      "schematized_array": null,
+                      "schemaless_array": null
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1602637589300,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
-            )
+            ),
         )
 
         val expectedRecords: List<OutputRecord> =
@@ -2819,7 +4379,7 @@ abstract class BasicFunctionalityIntegrationTest(
                                 } else {
                                     mapOf(
                                         "uuid" to "38F52396-736D-4B23-B5B4-F504D8894B97",
-                                        "probability" to 1.5
+                                        "probability" to 1.5,
                                     )
                                 },
                             "schematized_array" to
@@ -2861,7 +4421,7 @@ abstract class BasicFunctionalityIntegrationTest(
                                                 "street" to "113 Hickey Rd",
                                                 "zip" to "37932",
                                             ),
-                                        "flags" to listOf(true, false, false)
+                                        "flags" to listOf(true, false, false),
                                     )
                                 },
                             "schematized_array" to
@@ -2908,16 +4468,16 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testUnknownTypes() {
         assumeTrue(verifyDataWriting)
+        val unknownTypesSchema = ObjectType(linkedMapOf("id" to intType, "name" to unknownType))
         val stream =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "problematic_types",
-                Append,
-                ObjectType(linkedMapOf("id" to intType, "name" to unknownType)),
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(unknownTypesSchema, Append),
             )
 
         fun runSync() =
@@ -2931,12 +4491,14 @@ abstract class BasicFunctionalityIntegrationTest(
                         {
                           "id": 1,
                           "name": "ex falso quodlibet"
-                        }""".trimIndent(),
+                        }
+                        """
+                            .trimIndent(),
                         emittedAtMs = 1602637589100,
                         checkpointId = checkpointKeyForMedium()?.checkpointId,
-                        unknownFieldNames = setOf("name")
-                    )
-                )
+                        unknownFieldNames = setOf("name"),
+                    ),
+                ),
             )
         if (unknownTypesBehavior == UnknownTypesBehavior.FAIL) {
             assertThrows<DestinationUncleanExitException> { runSync() }
@@ -2959,7 +4521,7 @@ abstract class BasicFunctionalityIntegrationTest(
                                         // but intellij correctly detects that it's unreachable.
                                         UnknownTypesBehavior.FAIL ->
                                             throw IllegalStateException(
-                                                "The sync was expected to fail, so we should not be asserting that its records were correct"
+                                                "The sync was expected to fail, so we should not be asserting that its records were correct",
                                             )
                                     },
                             ),
@@ -2974,11 +4536,11 @@ abstract class BasicFunctionalityIntegrationTest(
                                                     "name",
                                                     AirbyteRecordMessageMetaChange.Change.NULLED,
                                                     AirbyteRecordMessageMetaChange.Reason
-                                                        .DESTINATION_SERIALIZATION_ERROR
-                                                )
+                                                        .DESTINATION_SERIALIZATION_ERROR,
+                                                ),
                                             )
                                         else -> emptyList()
-                                    }
+                                    },
                             ),
                     ),
                 )
@@ -3003,107 +4565,108 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testUnions() {
         assumeTrue(verifyDataWriting)
+        val unionsSchema =
+            ObjectType(
+                linkedMapOf(
+                    "id" to FieldType(IntegerType, nullable = true),
+                    // in jsonschema, there are two ways to achieve this:
+                    // {type: [string, int]}
+                    // {oneOf: [{type: string}, {type: int}]}
+                    // Our AirbyteType treats them identically, so we don't need two test cases.
+                    "combined_type" to
+                        FieldType(UnionType.of(StringType, IntegerType), nullable = true),
+                    // For destinations which promote unions to objects,
+                    // and also stringify schemaless values,
+                    // we should verify that the promoted schemaless value
+                    // is still labelled as "object" rather than "string".
+                    "union_of_string_and_schemaless_type" to
+                        FieldType(
+                            UnionType.of(ObjectTypeWithoutSchema, IntegerType),
+                            nullable = true,
+                        ),
+                    "union_of_objects_with_properties_identical" to
+                        FieldType(
+                            UnionType.of(
+                                ObjectType(
+                                    linkedMapOf(
+                                        "id" to FieldType(IntegerType, nullable = true),
+                                        "name" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                                ObjectType(
+                                    linkedMapOf(
+                                        "id" to FieldType(IntegerType, nullable = true),
+                                        "name" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                            ),
+                            nullable = true,
+                        ),
+                    "union_of_objects_with_properties_overlapping" to
+                        FieldType(
+                            UnionType.of(
+                                ObjectType(
+                                    linkedMapOf(
+                                        "id" to FieldType(IntegerType, nullable = true),
+                                        "name" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                                ObjectType(
+                                    linkedMapOf(
+                                        "name" to FieldType(StringType, nullable = true),
+                                        "flagged" to FieldType(BooleanType, nullable = true),
+                                    ),
+                                ),
+                            ),
+                            nullable = true,
+                        ),
+                    "union_of_objects_with_properties_nonoverlapping" to
+                        FieldType(
+                            UnionType.of(
+                                ObjectType(
+                                    linkedMapOf(
+                                        "id" to FieldType(IntegerType, nullable = true),
+                                        "name" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                                ObjectType(
+                                    linkedMapOf(
+                                        "flagged" to FieldType(BooleanType, nullable = true),
+                                        "description" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                            ),
+                            nullable = true,
+                        ),
+                    "union_of_objects_with_properties_contradicting" to
+                        FieldType(
+                            UnionType.of(
+                                ObjectType(
+                                    linkedMapOf(
+                                        "id" to FieldType(IntegerType, nullable = true),
+                                        "name" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                                ObjectType(
+                                    linkedMapOf(
+                                        "id" to FieldType(StringType, nullable = true),
+                                        "name" to FieldType(StringType, nullable = true),
+                                    ),
+                                ),
+                            ),
+                            nullable = true,
+                        ),
+                ),
+            )
         val stream =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "problematic_types",
-                Append,
-                ObjectType(
-                    linkedMapOf(
-                        "id" to FieldType(IntegerType, nullable = true),
-                        // in jsonschema, there are two ways to achieve this:
-                        // {type: [string, int]}
-                        // {oneOf: [{type: string}, {type: int}]}
-                        // Our AirbyteType treats them identically, so we don't need two test cases.
-                        "combined_type" to
-                            FieldType(UnionType.of(StringType, IntegerType), nullable = true),
-                        // For destinations which promote unions to objects,
-                        // and also stringify schemaless values,
-                        // we should verify that the promoted schemaless value
-                        // is still labelled as "object" rather than "string".
-                        "union_of_string_and_schemaless_type" to
-                            FieldType(
-                                UnionType.of(ObjectTypeWithoutSchema, IntegerType),
-                                nullable = true,
-                            ),
-                        "union_of_objects_with_properties_identical" to
-                            FieldType(
-                                UnionType.of(
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "id" to FieldType(IntegerType, nullable = true),
-                                            "name" to FieldType(StringType, nullable = true),
-                                        )
-                                    ),
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "id" to FieldType(IntegerType, nullable = true),
-                                            "name" to FieldType(StringType, nullable = true),
-                                        )
-                                    )
-                                ),
-                                nullable = true,
-                            ),
-                        "union_of_objects_with_properties_overlapping" to
-                            FieldType(
-                                UnionType.of(
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "id" to FieldType(IntegerType, nullable = true),
-                                            "name" to FieldType(StringType, nullable = true),
-                                        )
-                                    ),
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "name" to FieldType(StringType, nullable = true),
-                                            "flagged" to FieldType(BooleanType, nullable = true),
-                                        )
-                                    )
-                                ),
-                                nullable = true,
-                            ),
-                        "union_of_objects_with_properties_nonoverlapping" to
-                            FieldType(
-                                UnionType.of(
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "id" to FieldType(IntegerType, nullable = true),
-                                            "name" to FieldType(StringType, nullable = true),
-                                        )
-                                    ),
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "flagged" to FieldType(BooleanType, nullable = true),
-                                            "description" to FieldType(StringType, nullable = true),
-                                        )
-                                    )
-                                ),
-                                nullable = true,
-                            ),
-                        "union_of_objects_with_properties_contradicting" to
-                            FieldType(
-                                UnionType.of(
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "id" to FieldType(IntegerType, nullable = true),
-                                            "name" to FieldType(StringType, nullable = true),
-                                        )
-                                    ),
-                                    ObjectType(
-                                        linkedMapOf(
-                                            "id" to FieldType(StringType, nullable = true),
-                                            "name" to FieldType(StringType, nullable = true),
-                                        )
-                                    )
-                                ),
-                                nullable = true,
-                            ),
-                    ),
-                ),
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(unionsSchema, Append),
             )
         runSync(
             updatedConfig,
@@ -3112,47 +4675,53 @@ abstract class BasicFunctionalityIntegrationTest(
                 InputRecord(
                     stream,
                     """
-                        {
-                          "id": 1,
-                          "combined_type": "string1",
-                          "union_of_string_and_schemaless_type": {"foo": "bar"},
-                          "union_of_objects_with_properties_identical": { "id": 10, "name": "Joe" },
-                          "union_of_objects_with_properties_overlapping": { "id": 20, "name": "Jane", "flagged": true },
-                          "union_of_objects_with_properties_contradicting": { "id": 1, "name": "Jenny" },
-                          "union_of_objects_with_properties_nonoverlapping": { "id": 30, "name": "Phil", "flagged": false, "description":"Very Phil" }
-                        }""".trimIndent(),
+                    {
+                      "id": 1,
+                      "combined_type": "string1",
+                      "union_of_string_and_schemaless_type": {"foo": "bar"},
+                      "union_of_objects_with_properties_identical": { "id": 10, "name": "Joe" },
+                      "union_of_objects_with_properties_overlapping": { "id": 20, "name": "Jane", "flagged": true },
+                      "union_of_objects_with_properties_contradicting": { "id": 1, "name": "Jenny" },
+                      "union_of_objects_with_properties_nonoverlapping": { "id": 30, "name": "Phil", "flagged": false, "description":"Very Phil" }
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1602637589100,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
                 InputRecord(
                     stream,
                     """
-                        {
-                          "id": 2,
-                          "combined_type": 20,
-                          "union_of_objects_with_properties_identical": {},
-                          "union_of_objects_with_properties_overlapping": {},
-                          "union_of_objects_with_properties_nonoverlapping": {},
-                          "union_of_objects_with_properties_contradicting": { "id": "seal-one-hippity", "name": "James" }
-                        }""".trimIndent(),
+                    {
+                      "id": 2,
+                      "combined_type": 20,
+                      "union_of_objects_with_properties_identical": {},
+                      "union_of_objects_with_properties_overlapping": {},
+                      "union_of_objects_with_properties_nonoverlapping": {},
+                      "union_of_objects_with_properties_contradicting": { "id": "seal-one-hippity", "name": "James" }
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1602637589200,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
                 InputRecord(
                     stream,
                     """
-                        {
-                          "id": 3,
-                          "combined_type": null,
-                          "union_of_objects_with_properties_identical": null,
-                          "union_of_objects_with_properties_overlapping": null,
-                          "union_of_objects_with_properties_nonoverlapping": null,
-                          "union_of_objects_with_properties_contradicting": null
-                        }""".trimIndent(),
+                    {
+                      "id": 3,
+                      "combined_type": null,
+                      "union_of_objects_with_properties_identical": null,
+                      "union_of_objects_with_properties_overlapping": null,
+                      "union_of_objects_with_properties_nonoverlapping": null,
+                      "union_of_objects_with_properties_contradicting": null
+                    }
+                    """
+                        .trimIndent(),
                     emittedAtMs = 1602637589300,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
                 ),
-            )
+            ),
         )
 
         fun unionValue(typeName: String, value: Any?, skipSerialize: Boolean = false) =
@@ -3193,35 +4762,52 @@ abstract class BasicFunctionalityIntegrationTest(
                             "union_of_objects_with_properties_identical" to
                                 schematizedObject(linkedMapOf("id" to 10, "name" to "Joe")),
                             "union_of_objects_with_properties_overlapping" to
-                                schematizedObject(
-                                    linkedMapOf("id" to 20, "name" to "Jane", "flagged" to true)
-                                ),
-                            "union_of_objects_with_properties_contradicting" to
-                                // can't just call schematizedObject(... unionValue) - there's some
-                                // nontrivial interactions here
-                                when (schematizedObjectBehavior) {
-                                    // these two cases are simple
-                                    SchematizedNestedValueBehavior.PASS_THROUGH,
-                                    SchematizedNestedValueBehavior.STRONGLY_TYPE ->
+                                if (stringifyUnionObjects) {
+                                    """{"id":20,"name":"Jane","flagged":true}"""
+                                } else {
+                                    schematizedObject(
                                         linkedMapOf(
-                                            "id" to unionValue("integer", 1),
-                                            "name" to "Jenny"
-                                        )
-                                    // If we stringify, then the nested union value is _not_
-                                    // processed
-                                    // (note that `id` is mapped to 1 and not "1")
-                                    SchematizedNestedValueBehavior.STRINGIFY ->
-                                        """{"id":1,"name":"Jenny"}"""
+                                            "id" to 20,
+                                            "name" to "Jane",
+                                            "flagged" to true,
+                                        ),
+                                    )
+                                },
+                            "union_of_objects_with_properties_contradicting" to
+                                if (stringifyUnionObjects) {
+                                    """{"id":1,"name":"Jenny"}"""
+                                } else {
+                                    // can't just call schematizedObject(... unionValue) - there's
+                                    // some
+                                    // nontrivial interactions here
+                                    when (schematizedObjectBehavior) {
+                                        // these two cases are simple
+                                        SchematizedNestedValueBehavior.PASS_THROUGH,
+                                        SchematizedNestedValueBehavior.STRONGLY_TYPE ->
+                                            linkedMapOf(
+                                                "id" to unionValue("integer", 1),
+                                                "name" to "Jenny",
+                                            )
+                                        // If we stringify, then the nested union value is _not_
+                                        // processed
+                                        // (note that `id` is mapped to 1 and not "1")
+                                        SchematizedNestedValueBehavior.STRINGIFY ->
+                                            """{"id":1,"name":"Jenny"}"""
+                                    }
                                 },
                             "union_of_objects_with_properties_nonoverlapping" to
-                                schematizedObject(
-                                    linkedMapOf(
-                                        "id" to 30,
-                                        "name" to "Phil",
-                                        "flagged" to false,
-                                        "description" to "Very Phil",
+                                if (stringifyUnionObjects) {
+                                    """{"id":30,"name":"Phil","flagged":false,"description":"Very Phil"}"""
+                                } else {
+                                    schematizedObject(
+                                        linkedMapOf(
+                                            "id" to 30,
+                                            "name" to "Phil",
+                                            "flagged" to false,
+                                            "description" to "Very Phil",
+                                        ),
                                     )
-                                )
+                                },
                         ),
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
@@ -3235,26 +4821,38 @@ abstract class BasicFunctionalityIntegrationTest(
                             "union_of_objects_with_properties_identical" to
                                 schematizedObject(linkedMapOf()),
                             "union_of_objects_with_properties_nonoverlapping" to
-                                schematizedObject(linkedMapOf()),
+                                if (stringifyUnionObjects) {
+                                    """{}"""
+                                } else {
+                                    schematizedObject(linkedMapOf())
+                                },
                             "union_of_objects_with_properties_overlapping" to
-                                schematizedObject(linkedMapOf()),
+                                if (stringifyUnionObjects) {
+                                    """{}"""
+                                } else {
+                                    schematizedObject(linkedMapOf())
+                                },
                             "union_of_objects_with_properties_contradicting" to
-                                // similar to the previous record - need to handle this branch
-                                // manually
-                                when (schematizedObjectBehavior) {
-                                    // these two cases are simple
-                                    SchematizedNestedValueBehavior.PASS_THROUGH,
-                                    SchematizedNestedValueBehavior.STRONGLY_TYPE ->
-                                        linkedMapOf(
-                                            "id" to unionValue("string", "seal-one-hippity"),
-                                            "name" to "James"
-                                        )
-                                    // If we stringify, then the nested union value is _not_
-                                    // processed
-                                    // (note that `id` is mapped to 1 and not "1")
-                                    SchematizedNestedValueBehavior.STRINGIFY ->
-                                        """{"id":"seal-one-hippity","name":"James"}"""
-                                }
+                                if (stringifyUnionObjects) {
+                                    """{"id":"seal-one-hippity","name":"James"}"""
+                                } else {
+                                    // similar to the previous record - need to handle this branch
+                                    // manually
+                                    when (schematizedObjectBehavior) {
+                                        // these two cases are simple
+                                        SchematizedNestedValueBehavior.PASS_THROUGH,
+                                        SchematizedNestedValueBehavior.STRONGLY_TYPE ->
+                                            linkedMapOf(
+                                                "id" to unionValue("string", "seal-one-hippity"),
+                                                "name" to "James",
+                                            )
+                                        // If we stringify, then the nested union value is _not_
+                                        // processed
+                                        // (note that `id` is mapped to 1 and not "1")
+                                        SchematizedNestedValueBehavior.STRINGIFY ->
+                                            """{"id":"seal-one-hippity","name":"James"}"""
+                                    }
+                                },
                         ),
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
@@ -3268,7 +4866,7 @@ abstract class BasicFunctionalityIntegrationTest(
                             "union_of_objects_with_properties_identical" to null,
                             "union_of_objects_with_properties_overlapping" to null,
                             "union_of_objects_with_properties_nonoverlapping" to null,
-                            "union_of_objects_with_properties_contradicting" to null
+                            "union_of_objects_with_properties_contradicting" to null,
                         ),
                     airbyteMeta = OutputRecord.Meta(syncId = 42),
                 ),
@@ -3284,22 +4882,97 @@ abstract class BasicFunctionalityIntegrationTest(
     }
 
     /**
+     * Run a sync with a legacy union of number|boolean. Validate that we correctly coerce/null
+     * nonobvious values.
+     */
+    @Test
+    open fun testCoerceLegacyUnions() {
+        assumeTrue(verifyDataWriting)
+        assumeTrue(coercesLegacyUnions)
+        val legacyUnionsSchema =
+            ObjectType(
+                linkedMapOf(
+                    "x" to
+                        FieldType(
+                            // It's easier to just hardcode a jsonschema here.
+                            // In theory we could modify AirbyteTypeToJsonSchema to do this,
+                            // but legacy unions are really annoying to construct.
+                            UnknownType(Jsons.readTree("""{"type": ["number", "boolean"]}""")),
+                            nullable = true,
+                        ),
+                ),
+            )
+        val stream =
+            DestinationStream(
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = 42,
+                minimumGenerationId = 0,
+                syncId = 12,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(legacyUnionsSchema, Append),
+            )
+        runSync(
+            updatedConfig,
+            stream,
+            listOf(
+                // 42 wrapped in a string - should be coerced to 42
+                InputRecord(stream, """{"x": "42"}""", emittedAtMs = 1234),
+                // "potato" is not a valid number, should get nulled out.
+                InputRecord(stream, """{"x": "potato"}""", emittedAtMs = 2345),
+            ),
+        )
+        dumpAndDiffRecords(
+            parsedConfig,
+            listOf(
+                OutputRecord(
+                    extractedAt = 1234,
+                    generationId = 42,
+                    data = mapOf("x" to NumberValue(BigDecimal.valueOf(42))),
+                    airbyteMeta = OutputRecord.Meta(syncId = 12),
+                ),
+                OutputRecord(
+                    extractedAt = 2345,
+                    generationId = 42,
+                    data = mapOf("x" to NullValue),
+                    airbyteMeta =
+                        OutputRecord.Meta(
+                            syncId = 12,
+                            changes =
+                                listOf(
+                                    Change(
+                                        "x",
+                                        AirbyteRecordMessageMetaChange.Change.NULLED,
+                                        AirbyteRecordMessageMetaChange.Reason
+                                            .DESTINATION_SERIALIZATION_ERROR,
+                                    ),
+                                ),
+                        ),
+                ),
+            ),
+            stream,
+            primaryKey = emptyList(),
+            cursor = null,
+        )
+    }
+
+    /**
      * Verify that we can handle a stream with 0 columns. This is... not particularly useful, but
      * happens sometimes.
      */
     @Test
     open fun testNoColumns() {
         assumeTrue(verifyDataWriting)
+        val emptySchema = ObjectType(linkedMapOf())
         val stream =
             DestinationStream(
                 unmappedNamespace = randomizedNamespace,
                 unmappedName = "test_stream",
-                Append,
-                ObjectType(linkedMapOf()),
                 generationId = 42,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(emptySchema, Append),
             )
         runSync(
             updatedConfig,
@@ -3307,22 +4980,17 @@ abstract class BasicFunctionalityIntegrationTest(
             listOf(
                 InputRecord(
                     stream,
-                    """{"foo": "bar"}""",
+                    """{}""",
                     emittedAtMs = 1000L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         val expectedFirstRecord =
             OutputRecord(
                 extractedAt = 1000L,
                 generationId = 42,
-                data =
-                    if (preserveUndeclaredFields) {
-                        mapOf("foo" to "bar")
-                    } else {
-                        emptyMap()
-                    },
+                data = emptyMap(),
                 airbyteMeta = OutputRecord.Meta(syncId = 42),
             )
         dumpAndDiffRecords(
@@ -3341,9 +5009,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     stream,
                     """{}""",
                     emittedAtMs = 2000L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         dumpAndDiffRecords(
             parsedConfig,
@@ -3365,16 +5033,16 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testNoData() {
         assumeTrue(verifyDataWriting)
+        val idSchema = ObjectType(linkedMapOf("id" to intType))
         val stream =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(linkedMapOf("id" to intType)),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 0,
                 minimumGenerationId = 0,
                 syncId = 42,
-                namespaceMapper = namespaceMapperForMedium()
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
             )
         assertDoesNotThrow { runSync(updatedConfig, stream, messages = emptyList()) }
         dumpAndDiffRecords(
@@ -3389,16 +5057,16 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testTruncateRefreshNoData() {
         assumeTrue(verifyDataWriting)
+        val idNameSchema = ObjectType(linkedMapOf("id" to intType, "name" to stringType))
         fun makeStream(generationId: Long, minimumGenerationId: Long, syncId: Long) =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(linkedMapOf("id" to intType, "name" to stringType)),
-                generationId,
-                minimumGenerationId,
-                syncId,
-                namespaceMapper = namespaceMapperForMedium()
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
+                generationId = generationId,
+                minimumGenerationId = minimumGenerationId,
+                syncId = syncId,
+                namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idNameSchema, Append),
             )
         val firstStream = makeStream(generationId = 12, minimumGenerationId = 0, syncId = 42)
         runSync(
@@ -3409,9 +5077,9 @@ abstract class BasicFunctionalityIntegrationTest(
                     firstStream,
                     """{"id": 42, "name": "first_value"}""",
                     emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            )
+                    checkpointId = checkpointKeyForMedium()?.checkpointId,
+                ),
+            ),
         )
         val finalStream = makeStream(generationId = 13, minimumGenerationId = 13, syncId = 43)
         runSync(updatedConfig, finalStream, emptyList())
@@ -3427,161 +5095,42 @@ abstract class BasicFunctionalityIntegrationTest(
     @Test
     open fun testClear() {
         assumeTrue(verifyDataWriting)
+        val idSchema = ObjectType(linkedMapOf("id" to intType))
         val stream =
             DestinationStream(
-                randomizedNamespace,
-                "test_stream",
-                Append,
-                ObjectType(linkedMapOf("id" to intType)),
+                unmappedNamespace = randomizedNamespace,
+                unmappedName = "test_stream",
                 generationId = 1,
                 minimumGenerationId = 1,
                 syncId = 42,
                 namespaceMapper = namespaceMapperForMedium(),
+                tableSchema = makeTableSchema(idSchema, Append),
             )
         assertDoesNotThrow {
             runSync(
                 updatedConfig,
                 stream,
-                messages = listOf(InputGlobalCheckpoint(null, checkpointKeyForMedium()))
+                messages =
+                    listOf(
+                        InputGlobalCheckpoint(
+                            null,
+                            checkpointKeyForMedium(),
+                            sourceRecordCount = 0,
+                        ),
+                    ),
             )
-        }
-    }
-
-    private fun testNamespaceMapping(
-        namespaceMappingConfig: NamespaceMappingConfig,
-        namespaceValidator: (String?, String?, String, String) -> Unit
-    ) {
-        assumeTrue(dataChannelMedium == DataChannelMedium.SOCKET)
-        val stream =
-            DestinationStream(
-                unmappedNamespace = randomizedNamespace,
-                unmappedName = "test_stream__$randomizedNamespace", // in case namespace == null
-                Append,
-                ObjectType(linkedMapOf("id" to intType)),
-                generationId = 1,
-                minimumGenerationId = 1,
-                syncId = 42,
-                namespaceMapper =
-                    NamespaceMapper(
-                        namespaceDefinitionType = namespaceMappingConfig.namespaceDefinitionType,
-                        streamPrefix = namespaceMappingConfig.streamPrefix,
-                        namespaceFormat = namespaceMappingConfig.namespaceFormat
-                    )
-            )
-        namespaceValidator(
-            stream.unmappedNamespace,
-            stream.descriptor.namespace,
-            stream.unmappedName,
-            stream.descriptor.name,
-        )
-        runSync(
-            updatedConfig,
-            DestinationCatalog(listOf(stream)),
-            listOf(
-                InputRecord(
-                    stream,
-                    """{"id": 42}""",
-                    emittedAtMs = 1234L,
-                    checkpointId = checkpointKeyForMedium()?.checkpointId
-                )
-            ),
-            useFileTransfer = false,
-            destinationProcessFactory = destinationProcessFactory,
-            namespaceMappingConfig = namespaceMappingConfig
-        )
-        dumpAndDiffRecords(
-            parsedConfig,
-            listOf(
-                OutputRecord(
-                    extractedAt = 1234L,
-                    generationId = 1,
-                    data = mapOf("id" to 42),
-                    airbyteMeta = OutputRecord.Meta(syncId = 42),
-                )
-            ),
-            stream,
-            primaryKey = listOf(listOf("id")),
-            cursor = null,
-        )
-    }
-
-    @Test
-    open fun testNamespaceMappingDestinationNoPrefix() {
-        testNamespaceMapping(
-            NamespaceMappingConfig(namespaceDefinitionType = NamespaceDefinitionType.DESTINATION)
-        ) { _, mappedNamespace, unmappedName, mappedName ->
-            // For destination namespace mapping, the namespace should be the unmapped name.
-            assertNull(mappedNamespace)
-            assertEquals(unmappedName, mappedName)
-        }
-    }
-
-    @Test
-    open fun testNamespaceMappingDestinationWithPrefix() {
-        testNamespaceMapping(
-            NamespaceMappingConfig(
-                namespaceDefinitionType = NamespaceDefinitionType.DESTINATION,
-                streamPrefix = "prefix_",
-            )
-        ) { _, mappedNamespace, unmappedName, mappedName ->
-            // For destination namespace mapping, the namespace should be the unmapped name.
-            assertNull(mappedNamespace)
-            assertEquals("prefix_$unmappedName", mappedName)
-        }
-    }
-
-    @Test
-    open fun testNamespaceMappingSourceWithPrefix() {
-        testNamespaceMapping(
-            NamespaceMappingConfig(
-                namespaceDefinitionType = NamespaceDefinitionType.SOURCE,
-                streamPrefix = "prefix_",
-            )
-        ) { unmappedNamespace, mappedNamespace, unmappedName, mappedName ->
-            // For source namespace mapping, the namespace should be the unmapped namespace.
-            assertEquals(unmappedNamespace, mappedNamespace)
-            assertEquals("prefix_$unmappedName", mappedName)
-        }
-    }
-
-    @Test
-    open fun testNamespaceMappingCustomFormatNoPrefix() {
-        testNamespaceMapping(
-            NamespaceMappingConfig(
-                namespaceDefinitionType = NamespaceDefinitionType.CUSTOM_FORMAT,
-                namespaceFormat = "custom_\${SOURCE_NAMESPACE}_namespace",
-            )
-        ) { _, mappedNamespace, unmappedName, mappedName ->
-            // For custom namespace mapping, the namespace should be the custom format.
-            assertEquals("custom_${randomizedNamespace}_namespace", mappedNamespace)
-            assertEquals(unmappedName, mappedName)
-        }
-    }
-
-    @Test
-    open fun testNamespaceMappingCustomFormatNoMacroWithPrefix() {
-        testNamespaceMapping(
-            NamespaceMappingConfig(
-                namespaceDefinitionType = NamespaceDefinitionType.CUSTOM_FORMAT,
-                namespaceFormat = "custom_$randomizedNamespace",
-                streamPrefix = "prefix_",
-            )
-        ) { _, mappedNamespace, unmappedName, mappedName ->
-            // For custom namespace mapping, the namespace should be the custom format.
-            assertEquals("custom_${randomizedNamespace}", mappedNamespace)
-            assertEquals("prefix_$unmappedName", mappedName)
         }
     }
 
     private fun schematizedObject(
         fullObject: LinkedHashMap<String, Any?>,
-        coercedObject: LinkedHashMap<String, Any?> = fullObject
+        coercedObject: LinkedHashMap<String, Any?> = fullObject,
     ): AirbyteValue =
         schematizedObject(ObjectValue.from(fullObject), ObjectValue.from(coercedObject))
 
     private fun schematizedObject(
         fullObject: ObjectValue,
-        coercedObject: ObjectValue = fullObject
+        coercedObject: ObjectValue = fullObject,
     ): AirbyteValue {
         return when (schematizedObjectBehavior) {
             SchematizedNestedValueBehavior.PASS_THROUGH -> fullObject
@@ -3596,6 +5145,7 @@ abstract class BasicFunctionalityIntegrationTest(
                 expect(originalValue, parsedValue, allTypesBehavior.timeWithTimezoneBehavior)
             Untyped -> expect(originalValue, parsedValue, SimpleValueBehavior.PASS_THROUGH)
         }
+
     private fun timetzChange(change: Change?) =
         when (allTypesBehavior) {
             is StronglyTyped -> expectChange(change, allTypesBehavior.timeWithTimezoneBehavior)
@@ -3605,7 +5155,7 @@ abstract class BasicFunctionalityIntegrationTest(
     private fun expect(
         originalValue: String,
         parsedValue: Any?,
-        behavior: SimpleValueBehavior
+        behavior: SimpleValueBehavior,
     ): Any? {
         val passthroughValue = originalValue.deserializeToNode().toAirbyteValue()
         return when (behavior) {
@@ -3620,6 +5170,7 @@ abstract class BasicFunctionalityIntegrationTest(
             SimpleValueBehavior.STRONGLY_TYPE -> parsedValue
         }
     }
+
     private fun expectChange(change: Change?, behavior: SimpleValueBehavior) =
         when (behavior) {
             SimpleValueBehavior.PASS_THROUGH -> null
@@ -3637,12 +5188,42 @@ abstract class BasicFunctionalityIntegrationTest(
                 nullable = true,
             )
         private val timestamptzType = FieldType(TimestampTypeWithTimezone, nullable = true)
+
+        // This will get blown away in the tests as the DestinationStream's we are mocking just get
+        // converted to the protocol which has no concept of destination schemas
+        val emptyTableSchema: StreamTableSchema =
+            StreamTableSchema(
+                columnSchema =
+                    ColumnSchema(
+                        inputSchema = mapOf(),
+                        inputToFinalColumnNames = mapOf(),
+                        finalSchema = mapOf(),
+                    ),
+                importType = Append,
+                tableNames = TableNames(finalTableName = TableName("namespace", "test")),
+            )
+
+        /** Helper to create a StreamTableSchema from an ObjectType and ImportType for tests */
+        fun makeTableSchema(schema: ObjectType, importType: ImportType): StreamTableSchema {
+            val inputSchema = schema.properties
+            return StreamTableSchema(
+                columnSchema =
+                    ColumnSchema(
+                        inputSchema = inputSchema,
+                        inputToFinalColumnNames = inputSchema.keys.associateWith { it },
+                        finalSchema = mapOf(),
+                    ),
+                importType = importType,
+                tableNames = TableNames(finalTableName = TableName("namespace", "test")),
+            )
+        }
     }
 
-    private fun checkpointKeyForMedium(): CheckpointKey? {
+    fun checkpointKeyForMedium(index: Int = 1, partitionId: String = "1"): CheckpointKey? {
         return when (dataChannelMedium) {
             DataChannelMedium.STDIO -> null
-            DataChannelMedium.SOCKET -> CheckpointKey(CheckpointIndex(1), CheckpointId("1"))
+            DataChannelMedium.SOCKET ->
+                CheckpointKey(CheckpointIndex(index), CheckpointId(partitionId))
         }
     }
 
@@ -3650,7 +5231,7 @@ abstract class BasicFunctionalityIntegrationTest(
     private fun expectedBytesForMediumAndFormat(
         bytesForStdio: Long,
         bytesForSocketJsonl: Long,
-        bytesForSocketProtobuf: Long
+        bytesForSocketProtobuf: Long,
     ): Long {
         return when (dataChannelMedium) {
             DataChannelMedium.STDIO -> bytesForStdio
@@ -3658,18 +5239,27 @@ abstract class BasicFunctionalityIntegrationTest(
                 when (dataChannelFormat) {
                     DataChannelFormat.JSONL -> bytesForSocketJsonl
                     DataChannelFormat.PROTOBUF -> bytesForSocketProtobuf
-                    DataChannelFormat.FLATBUFFERS -> TODO()
                 }
         }
     }
 
-    protected fun namespaceMapperForMedium(): NamespaceMapper {
-        return when (dataChannelMedium) {
-            DataChannelMedium.STDIO ->
-                NamespaceMapper(namespaceDefinitionType = NamespaceDefinitionType.SOURCE)
-            // TODO: Return something more dynamic? Based on the test?
-            DataChannelMedium.SOCKET ->
-                NamespaceMapper(namespaceDefinitionType = NamespaceDefinitionType.SOURCE)
+    private fun expectedAdditionalStats(): AdditionalStats {
+        val expectedAdditionalStats = AdditionalStats()
+        StateAdditionalStatsStore.ObservabilityMetrics.entries.forEach {
+            expectedAdditionalStats.withAdditionalProperty(it.metricName, 0.0)
         }
+        return expectedAdditionalStats
+    }
+
+    fun namespaceMapperForMedium(): NamespaceMapper = dataChannelMedium.namespaceMapper()
+}
+
+fun DataChannelMedium.namespaceMapper(): NamespaceMapper {
+    return when (this) {
+        DataChannelMedium.STDIO ->
+            NamespaceMapper(namespaceDefinitionType = NamespaceDefinitionType.SOURCE)
+        // TODO: Return something more dynamic? Based on the test?
+        DataChannelMedium.SOCKET ->
+            NamespaceMapper(namespaceDefinitionType = NamespaceDefinitionType.SOURCE)
     }
 }

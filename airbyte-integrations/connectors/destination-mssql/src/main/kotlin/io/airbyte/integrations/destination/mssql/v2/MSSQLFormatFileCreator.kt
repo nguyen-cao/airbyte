@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.mssql.v2
@@ -17,7 +17,7 @@ private const val COLLATION = "SQL_Latin1_General_CP1_CI_AS"
 internal class MSSQLFormatFileCreator(
     private val dataSource: DataSource,
     private val stream: DestinationStream,
-    private val azureBlobClient: AzureBlobClient
+    private val azureBlobClient: AzureBlobClient,
 ) {
 
     /** Simple struct holding column metadata retrieved from SQL Server. */
@@ -39,10 +39,10 @@ internal class MSSQLFormatFileCreator(
 
     fun createAndUploadFormatFile(defaultSchemaName: String): AzureBlob {
         // 1) Determine the target schema (namespace) to which this stream maps.
-        val targetSchema = stream.descriptor.namespace ?: defaultSchemaName
+        val targetSchema = stream.mappedDescriptor.namespace ?: defaultSchemaName
 
         // 2) Retrieve DB columns for the table (in ordinal order).
-        val dbColumns = fetchTableColumns(targetSchema, stream.descriptor.name)
+        val dbColumns = fetchTableColumns(targetSchema, stream.mappedDescriptor.name)
 
         // 3) Build a CSV-to-DB mapping so each CSV column lines up with the correct DB column.
         val csvColumnNames = stream.schema.withAirbyteMeta(true).toCsvHeader().toList()
@@ -77,7 +77,8 @@ internal class MSSQLFormatFileCreator(
             WHERE TABLE_SCHEMA = ? 
               AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
-        """.trimIndent()
+            """
+                .trimIndent()
 
         dataSource.connection.use { conn ->
             conn.prepareStatement(sql).use { stmt ->
@@ -114,7 +115,7 @@ internal class MSSQLFormatFileCreator(
      */
     internal fun buildCsvToDbMapping(
         csvColumnNames: List<String>,
-        dbColumns: List<ColumnInfo>
+        dbColumns: List<ColumnInfo>,
     ): List<CsvToDbColumn> {
         return csvColumnNames.mapIndexed { idx, csvColName ->
             val match =
@@ -141,7 +142,7 @@ internal class MSSQLFormatFileCreator(
         csvToDbMapping: List<CsvToDbColumn>,
         delimiter: String,
         rowDelimiter: String,
-        formatFileVersion: String
+        formatFileVersion: String,
     ): String {
         val sb = StringBuilder()
 
@@ -164,16 +165,17 @@ internal class MSSQLFormatFileCreator(
             // For simplicity, apply the UTF-8 collation to all text-based columns (SQLCHAR).
             // If the column is numeric or date, the collation will be ignored by the server anyway.
             sb.appendLine(
-                "%-8d %-10s %-8d %-8d %-8s %-8d %s %s".format(
-                    csvPos,
-                    bcpType,
-                    0,
-                    length,
-                    usedDelimiter,
-                    dbOrdinal,
-                    dbColName,
-                    COLLATION,
-                ),
+                "%-8d %-10s %-8d %-8d %-8s %-8d %s %s"
+                    .format(
+                        csvPos,
+                        bcpType,
+                        0,
+                        length,
+                        usedDelimiter,
+                        dbOrdinal,
+                        dbColName,
+                        COLLATION,
+                    ),
             )
         }
 
@@ -210,7 +212,7 @@ internal class MSSQLFormatFileCreator(
                     if (charMaxLength != null && charMaxLength > 0) {
                         // For nvarchar, consider doubling (2 bytes per char)
                         (charMaxLength * if (dataType.startsWith("n")) 2 else 1).coerceAtLeast(
-                            4
+                            4,
                         ) // small safety floor
                     } else {
                         // fallback for (max) or unknown
@@ -227,6 +229,6 @@ internal class MSSQLFormatFileCreator(
      * "mySchema/myStreamName/format/1676999999999/formatFile.fmt"
      */
     private fun buildFormatFileBlobPath(outputSchema: String): String {
-        return "${outputSchema}/${stream.descriptor.name}/format/${System.currentTimeMillis()}/formatFile.fmt"
+        return "${outputSchema}/${stream.mappedDescriptor.name}/format/${System.currentTimeMillis()}/formatFile.fmt"
     }
 }

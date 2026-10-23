@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.cdk.load.spec
@@ -12,7 +12,9 @@ import com.deblock.jsondiff.matcher.StrictJsonObjectPartialMatcher
 import com.deblock.jsondiff.matcher.StrictPrimitivePartialMatcher
 import com.deblock.jsondiff.viewer.OnlyErrorDiffViewer
 import io.airbyte.cdk.command.FeatureFlag
+import io.airbyte.cdk.load.command.EnvVarConstants.AIRBYTE_EDITION
 import io.airbyte.cdk.load.command.Property
+import io.airbyte.cdk.load.test.util.CharacterizationTest.testResourcesPath
 import io.airbyte.cdk.load.test.util.FakeDataDumper
 import io.airbyte.cdk.load.test.util.IntegrationTest
 import io.airbyte.cdk.load.test.util.NoopDestinationCleaner
@@ -21,7 +23,6 @@ import io.airbyte.cdk.load.util.Jsons
 import io.airbyte.cdk.load.util.deserializeToPrettyPrintedString
 import io.airbyte.protocol.models.v0.AirbyteMessage
 import java.nio.file.Files
-import java.nio.file.Path
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions
 import org.junit.jupiter.api.Test
@@ -46,20 +47,26 @@ abstract class SpecTest(
         recordMangler = NoopExpectedRecordMapper,
         micronautProperties = micronautProperties,
     ) {
-    private val testResourcesPath = Path.of("src/test-integration/resources")
-
     @Test
     fun testSpecOss() {
-        testSpec("expected-spec-oss.json")
+        testSpec(
+            expectedSpecFilename = "expected-spec-oss.json",
+            additionalProperties = mapOf(AIRBYTE_EDITION to "OSS"),
+        )
     }
 
     @Test
     fun testSpecCloud() {
-        testSpec("expected-spec-cloud.json", FeatureFlag.AIRBYTE_CLOUD_DEPLOYMENT)
+        testSpec(
+            expectedSpecFilename = "expected-spec-cloud.json",
+            additionalProperties = mapOf(AIRBYTE_EDITION to "CLOUD"),
+            featureFlags = arrayOf(FeatureFlag.AIRBYTE_CLOUD_DEPLOYMENT),
+        )
     }
 
     private fun testSpec(
         expectedSpecFilename: String,
+        additionalProperties: Map<Property, String> = emptyMap(),
         vararg featureFlags: FeatureFlag,
     ) {
         val expectedSpecPath = testResourcesPath.resolve(expectedSpecFilename)
@@ -73,7 +80,7 @@ abstract class SpecTest(
             destinationProcessFactory.createDestinationProcess(
                 "spec",
                 featureFlags = featureFlags,
-                micronautProperties = micronautProperties
+                micronautProperties = micronautProperties + additionalProperties,
             )
         runBlocking { process.run() }
         val messages = process.readMessages()
@@ -82,7 +89,7 @@ abstract class SpecTest(
         Assertions.assertEquals(
             specMessages.size,
             1,
-            "Expected to receive exactly one connection status message, but got ${specMessages.size}: $specMessages"
+            "Expected to receive exactly one connection status message, but got ${specMessages.size}: $specMessages",
         )
 
         val spec = specMessages.first().spec
@@ -97,7 +104,7 @@ abstract class SpecTest(
             )
         val diff =
             OnlyErrorDiffViewer.from(
-                    DiffGenerator.diff(expectedSpec, Jsons.writeValueAsString(spec), jsonMatcher)
+                    DiffGenerator.diff(expectedSpec, Jsons.writeValueAsString(spec), jsonMatcher),
                 )
                 .toString()
         assertAll(
@@ -105,15 +112,15 @@ abstract class SpecTest(
             {
                 Assertions.assertTrue(
                     diff.isEmpty(),
-                    "Detected semantic diff in JSON:\n" + diff.prependIndent("\t\t")
+                    "Detected semantic diff in JSON:\n" + diff.prependIndent("\t\t"),
                 )
             },
             {
                 Assertions.assertTrue(
                     expectedSpec == actualSpecPrettyPrint,
-                    "File contents did not equal generated spec, see git diff for details"
+                    "File contents did not equal generated spec, see git diff for details",
                 )
-            }
+            },
         )
     }
 }

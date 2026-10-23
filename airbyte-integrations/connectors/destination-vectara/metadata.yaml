@@ -2,7 +2,8 @@ data:
   allowedHosts:
     hosts:
       - api.vectara.io
-      - "vectara-prod-${self.customer_id}.auth.us-west-2.amazoncognito.com"
+      - auth.vectara.com
+      - auth.vectara.io
   registryOverrides:
     oss:
       enabled: true
@@ -13,11 +14,11 @@ data:
   connectorSubtype: database
   connectorType: destination
   definitionId: 102900e7-a236-4c94-83e4-a4189b99adc2
-  dockerImageTag: 0.2.31
+  dockerImageTag: 0.2.32
   dockerRepository: airbyte/destination-vectara
   githubIssueLabel: destination-vectara
   icon: vectara.svg
-  license: MIT
+  license: ELv2
   name: Vectara
   remoteRegistries:
     pypi:
@@ -38,4 +39,11 @@ data:
           secretStore:
             type: GSM
             alias: airbyte-connector-testing-secret-store
+  externalDocumentationUrls:
+    - title: Vectara documentation
+      url: https://docs.vectara.com/
+      type: api_reference
+    - title: Authentication
+      url: https://docs.vectara.com/docs/learn/authentication/auth-overview
+      type: authentication_guide
 metadataSpecVersion: "1.0"

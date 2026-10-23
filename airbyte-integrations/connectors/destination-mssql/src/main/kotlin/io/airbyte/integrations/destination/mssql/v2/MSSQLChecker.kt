@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.mssql.v2
@@ -14,6 +14,7 @@ import io.airbyte.cdk.load.data.ObjectType
 import io.airbyte.cdk.load.message.DestinationRecordJsonSource
 import io.airbyte.cdk.load.message.DestinationRecordRaw
 import io.airbyte.cdk.load.util.Jsons
+import io.airbyte.cdk.load.util.UUIDGenerator
 import io.airbyte.integrations.destination.mssql.v2.config.AzureBlobStorageClientCreator
 import io.airbyte.integrations.destination.mssql.v2.config.BulkLoadConfiguration
 import io.airbyte.integrations.destination.mssql.v2.config.MSSQLConfiguration
@@ -28,8 +29,10 @@ import javax.sql.DataSource
 import kotlinx.coroutines.runBlocking
 
 @Singleton
-class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
-    DestinationChecker<MSSQLConfiguration> {
+class MSSQLChecker(
+    private val dataSourceFactory: MSSQLDataSourceFactory,
+    private val uuidGenerator: UUIDGenerator,
+) : DestinationChecker<MSSQLConfiguration> {
 
     companion object {
         private const val TEST_CSV_FILENAME = "check_test_data.csv"
@@ -47,7 +50,7 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
             generationId = 0L,
             minimumGenerationId = 0L,
             syncId = 0L,
-            namespaceMapper = NamespaceMapper()
+            namespaceMapper = NamespaceMapper(),
         )
 
     override fun check(config: MSSQLConfiguration) {
@@ -76,7 +79,7 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
         connection: Connection,
         config: MSSQLConfiguration,
         dataSource: DataSource,
-        sqlBuilder: MSSQLQueryBuilder
+        sqlBuilder: MSSQLQueryBuilder,
     ) {
         val bulkLoadConfig =
             config.mssqlLoadTypeConfiguration.loadTypeConfiguration as BulkLoadConfiguration
@@ -84,26 +87,26 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
         // Create necessary helpers
         val azureBlobClient =
             AzureBlobStorageClientCreator.createAzureBlobClient(
-                bulkLoadConfiguration = bulkLoadConfig
+                bulkLoadConfiguration = bulkLoadConfig,
             )
         val mssqlFormatFileCreator =
             MSSQLFormatFileCreator(
                 dataSource,
                 stream = testStream,
-                azureBlobClient = azureBlobClient
+                azureBlobClient = azureBlobClient,
             )
         val mssqlBulkLoadHandler =
             MSSQLBulkLoadHandler(
                 dataSource,
                 config.schema,
-                testStream.descriptor.name,
+                testStream.mappedDescriptor.name,
                 bulkLoadConfig.bulkLoadDataSource,
-                sqlBuilder
+                sqlBuilder,
             )
 
         // Prepare test CSV data
         val csvData = createTestCsvData(testStream)
-        val csvFilePath = "${testStream.descriptor.name}/$TEST_CSV_FILENAME"
+        val csvFilePath = "${testStream.mappedDescriptor.name}/$TEST_CSV_FILENAME"
 
         // Upload files & perform bulk load
         runBlocking {
@@ -118,7 +121,7 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
                 mssqlBulkLoadHandler.bulkLoadForAppendOverwrite(csvBlob.key, formatFileBlob.key)
 
                 // 4) Verify the data loaded successfully
-                verifyDataLoaded(connection, config.schema, testStream.descriptor.name)
+                verifyDataLoaded(connection, config.schema, testStream.mappedDescriptor.name)
             } finally {
                 // 5) Clean up remote files
                 azureBlobClient.delete(formatFileBlob)
@@ -130,7 +133,7 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
     /** Creates a CSV file with headers matching the required table structure and one test record */
     private fun createTestCsvData(stream: DestinationStream): ByteArray {
         return ByteArrayOutputStream().use { outputStream ->
-            MSSQLCSVFormattingWriter(stream, outputStream, true).use { csvWriter ->
+            MSSQLCSVFormattingWriter(stream, outputStream).use { csvWriter ->
                 // TODO this is kind of dumb
                 val destinationRecord =
                     AirbyteMessage()
@@ -138,13 +141,14 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
                         .withRecord(
                             AirbyteRecordMessage()
                                 .withEmittedAt(0)
-                                .withData(Jsons.valueToTree(mapOf(COLUMN_NAME to TEST_ID_VALUE)))
+                                .withData(Jsons.valueToTree(mapOf(COLUMN_NAME to TEST_ID_VALUE))),
                         )
                         .let { message ->
                             DestinationRecordRaw(
                                 stream,
                                 DestinationRecordJsonSource(message),
                                 Jsons.writeValueAsString(message).length.toLong(),
+                                airbyteRawId = uuidGenerator.v7(),
                             )
                         }
                 csvWriter.accept(destinationRecord)
@@ -168,7 +172,7 @@ class MSSQLChecker(private val dataSourceFactory: MSSQLDataSourceFactory) :
                     val count = resultSet.getInt(1)
                     if (count != 1) {
                         throw RuntimeException(
-                            "Bulk load verification failed: Expected 1 record but found $count"
+                            "Bulk load verification failed: Expected 1 record but found $count",
                         )
                     }
                 } else {

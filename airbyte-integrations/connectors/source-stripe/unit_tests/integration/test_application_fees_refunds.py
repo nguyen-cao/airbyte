@@ -9,7 +9,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import freezegun
-from source_stripe import SourceStripe
+from unit_tests.conftest import get_source
 
 from airbyte_cdk.models import AirbyteStateBlob, ConfiguredAirbyteCatalog, FailureType, StreamDescriptor, SyncMode
 from airbyte_cdk.sources.source import TState
@@ -62,15 +62,17 @@ def _events_request() -> StripeRequestBuilder:
 
 
 def _config() -> ConfigBuilder:
-    return ConfigBuilder().with_start_date(_NOW - timedelta(days=75)).with_account_id(_ACCOUNT_ID).with_client_secret(_CLIENT_SECRET)
+    return (
+        ConfigBuilder()
+        .with_start_date(_NOW - timedelta(days=75))
+        .with_account_id(_ACCOUNT_ID)
+        .with_client_secret(_CLIENT_SECRET)
+        .with_slice_range_in_days(365)
+    )
 
 
 def _catalog(sync_mode: SyncMode) -> ConfiguredAirbyteCatalog:
     return CatalogBuilder().with_stream(_STREAM_NAME, sync_mode).build()
-
-
-def _source(catalog: ConfiguredAirbyteCatalog, config: Dict[str, Any], state: Optional[TState]) -> SourceStripe:
-    return SourceStripe(catalog, config, state)
 
 
 def _an_event() -> RecordBuilder:
@@ -125,7 +127,7 @@ def _read(
 ) -> EntrypointOutput:
     catalog = _catalog(sync_mode)
     config = config_builder.build()
-    return read(_source(catalog, config, state), config, catalog, state, expecting_exception)
+    return read(get_source(config, state), config, catalog, state, expecting_exception)
 
 
 @freezegun.freeze_time(_NOW.isoformat())
@@ -136,11 +138,13 @@ class FullRefreshTest(TestCase):
             _application_fees_request().with_created_gte(_A_START_DATE).with_created_lte(_NOW).with_limit(100).build(),
             _application_fees_response()
             .with_record(
-                _an_application_fee().with_field(
-                    _REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund()).with_record(_a_refund()))
-                )
+                _an_application_fee()
+                .with_id("1")
+                .with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund()).with_record(_a_refund())))
             )
-            .with_record(_an_application_fee().with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund()))))
+            .with_record(
+                _an_application_fee().with_id("2").with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund())))
+            )
             .build(),
         )
 
@@ -228,13 +232,17 @@ class FullRefreshTest(TestCase):
             .with_limit(100)
             .build(),
             _application_fees_response()
-            .with_record(_an_application_fee().with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund()))))
+            .with_record(
+                _an_application_fee().with_id("1").with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund())))
+            )
             .build(),
         )
         http_mocker.get(
             _application_fees_request().with_created_gte(slice_datetime).with_created_lte(_NOW).with_limit(100).build(),
             _application_fees_response()
-            .with_record(_an_application_fee().with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund()))))
+            .with_record(
+                _an_application_fee().with_id("2").with_field(_REFUNDS_FIELD, _as_dict(_refunds_response().with_record(_a_refund())))
+            )
             .build(),
         )
 

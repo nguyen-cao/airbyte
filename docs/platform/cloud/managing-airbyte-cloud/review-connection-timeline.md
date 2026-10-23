@@ -2,7 +2,7 @@
 products: all
 ---
 
-# Review the Connection Timeline
+# Connection timeline
 
 The Connection Timeline displays historical information about relevant connection events. You can also view and download logs, find any relevant errors, and find a link to a job to share with Support.
 
@@ -63,6 +63,9 @@ Completed syncs, [refreshes](/platform/operator-guides/refreshes), and [clears](
 | Failed     | The sync encountered a fatal error, and needs intervention to resolve. Airbyte loaded a subset or none of the data to the destination. |
 | Cancelled  | Someone cancelled the sync before it finished.                                                                                          |
 | Running    | The sync is currently running.                                                                                                         |
+| Queued     | The sync is waiting for data worker capacity to become available. (Cloud Pro and Enterprise Flex only)                                  |
+
+Queued syncs may appear as "Cancelled" in the timeline if they were cancelled due to a connection update, the next scheduled run arriving, or the 8-hour timeout for connections with a manual schedule type. For more information about capacity queuing, see [Manage and monitor data workers](./manage-data-workers.md).
 
 ### How the Connection Timeline reflects moved data
 

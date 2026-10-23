@@ -53,7 +53,6 @@ def test_streams(requests_mock, config_raw):
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/events/properties/top", setup_response(200, {}))
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/annotations", setup_response(200, {}))
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/cohorts/list", setup_response(200, {"id": 123}))
-    requests_mock.register_uri("GET", "https://mixpanel.com/api/query/engage/revenue", setup_response(200, {}))
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/funnels", setup_response(200, {}))
     requests_mock.register_uri(
         "GET", "https://mixpanel.com/api/query/funnels/list", setup_response(200, {"funnel_id": 123, "name": "name"})
@@ -65,7 +64,8 @@ def test_streams(requests_mock, config_raw):
     )
 
     streams = SourceMixpanel(MagicMock(), config_raw, MagicMock()).streams(config_raw)
-    assert len(streams) == 7
+    assert len(streams) == 6
+    assert "revenue" not in [stream.name for stream in streams]
 
 
 def test_streams_string_date(requests_mock, config_raw):
@@ -73,7 +73,6 @@ def test_streams_string_date(requests_mock, config_raw):
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/events/properties/top", setup_response(200, {}))
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/annotations", setup_response(200, {}))
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/cohorts/list", setup_response(200, {"id": 123}))
-    requests_mock.register_uri("GET", "https://mixpanel.com/api/query/engage/revenue", setup_response(200, {}))
     requests_mock.register_uri("POST", "https://mixpanel.com/api/query/engage", setup_response(200, {}))
     requests_mock.register_uri("GET", "https://mixpanel.com/api/query/funnels/list", setup_response(402, {"error": "Payment required"}))
     requests_mock.register_uri(
@@ -85,7 +84,7 @@ def test_streams_string_date(requests_mock, config_raw):
     config["start_date"] = "2020-01-01"
     config["end_date"] = "2020-01-02"
     streams = SourceMixpanel(MagicMock(), config, MagicMock()).streams(config)
-    assert len(streams) == 7
+    assert len(streams) == 6
 
 
 @pytest.mark.parametrize(
@@ -99,12 +98,12 @@ def test_streams_string_date(requests_mock, config_raw):
         (
             {"credentials": {"api_secret": "secret"}, "start_date": "20 Jan 2021"},
             False,
-            "time data '20 Jan 2021' does not match format '%Y-%m-%dT%H:%M:%SZ'",
+            "Could not parse start date: 20 Jan 2021. Please enter a valid start date.",
         ),
         (
             {"credentials": {"api_secret": "secret"}, "end_date": "20 Jan 2021"},
             False,
-            "time data '20 Jan 2021' does not match format '%Y-%m-%dT%H:%M:%SZ'",
+            "Could not parse end date: 20 Jan 2021. Please enter a valid end date.",
         ),
         (
             {"credentials": {"username": "user", "secret": "secret"}},
@@ -130,14 +129,9 @@ def test_streams_string_date(requests_mock, config_raw):
     ),
 )
 def test_config_validation(config, expected_is_success, expected_error_message, requests_mock):
-    requests_mock.get(
-        "https://eu.mixpanel.com/api/query/engage/revenue?project_id=2397709&from_date=2021-02-01&to_date=2021-02-10",
-        status_code=200,
-        json=[{}],
-    )
-    requests_mock.get(
-        "https://eu.mixpanel.com/api/query/engage/revenue?from_date=2021-02-01&to_date=2021-03-02", status_code=200, json=[{}]
-    )
+    requests_mock.get("https://mixpanel.com/api/query/cohorts/list", status_code=200, json=[{"a": 1, "created": "2021-02-11T00:00:00Z"}])
+    requests_mock.get("https://eu.mixpanel.com/api/query/cohorts/list", status_code=200, json=[{"a": 1, "created": "2021-02-11T00:00:00Z"}])
+
     try:
         is_success, message = SourceMixpanel(MagicMock(), config, MagicMock()).check_connection(MagicMock(), config)
     except AirbyteTracedException as e:

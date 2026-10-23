@@ -66,7 +66,7 @@ Normally under the CDC mode, the MySQL source will first run a full refresh sync
 
 The root causes is that the binglogs needed for the incremental sync have been removed by MySQL. This can occur under the following scenarios:
 
-- When there are lots of database updates resulting in more WAL files than allowed in the `pg_wal` directory, Postgres will purge or archive the WAL files. This scenario is preventable. Possible solutions include:
+- When there are lots of database updates resulting in binary log files expiring before a sync could be made. This scenario is preventable. Possible solutions include:
   - Sync the data source more frequently.
   - For standard MySQL installations: Set a higher `binlog_expire_logs_seconds`. It's recommended to set this value to a time period of 7 days. See [MySQL binary log documentation](https://dev.mysql.com/doc/refman/8.0/en/replication-options-binary-log.html#sysvar_binlog_expire_logs_seconds) for details.
   - For Amazon RDS MySQL instances: Set the `binlog retention hours` parameter to at least 24 hours (or higher). This parameter defaults to 0, causing binlogs to be removed immediately. Use the RDS-specific procedure described in the [AWS documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/mysql-stored-proc-configuring.html). For example:
@@ -81,10 +81,51 @@ When a sync runs for the first time using CDC, Airbyte performs an initial consi
 
 If seeing `EventDataDeserializationException` errors intermittently with root cause `EOFException` or `SocketException`, you may need to extend the following _MySql server_ timeout values by running:
 
+**For MySQL 8.0.26 and later:**
+
+```sql
+SET GLOBAL replica_net_timeout = 120;
+SET GLOBAL thread_pool_idle_timeout = 120;
 ```
-set global slave_net_timeout = 120;
-set global thread_pool_idle_timeout = 120;
+
+**For MySQL versions before 8.0.26:**
+
+```sql
+SET GLOBAL slave_net_timeout = 120;
+SET GLOBAL thread_pool_idle_timeout = 120;
 ```
+
+:::note
+`slave_net_timeout` was renamed to `replica_net_timeout` in MySQL 8.0.26. Use the appropriate variable depending on your MySQL version.
+:::
+
+### EOFException: Failed to read next byte from position
+
+A CDC sync may fail while reading the binary log with this error:
+
+```text
+Caused by: java.io.EOFException: Failed to read next byte from position <binlog_position>
+```
+
+MySQL closed the connection because Airbyte didn't read from it within `net_write_timeout` seconds (default 60). This can happen when Airbyte reads a large backlog or a large transaction while the destination is slow to accept data.
+
+To resolve this error, increase `net_write_timeout` on your MySQL server. Start with 3600 seconds.
+
+1. Check the current value.
+
+   ```sql
+   SHOW GLOBAL VARIABLES LIKE 'net_write_timeout';
+   ```
+
+2. Increase the value.
+
+   ```sql
+   SET GLOBAL net_write_timeout = 3600;
+   ```
+
+   `SET GLOBAL` only applies to new connections, and MySQL resets it when the server restarts. To keep the value, use `SET PERSIST` on MySQL 8.0 and later, or set it in your MySQL configuration file. On Amazon RDS and Aurora, set it in your DB parameter group.
+
+3. Run the sync again.
 
 ### (Advanced) Enable GTIDs
 
@@ -95,7 +136,7 @@ Global transaction identifiers \(GTIDs\) uniquely identify transactions that occ
 
 ### (Advanced) Setting up initial CDC waiting time
 
-The MySQl connector may need some time to start processing the data in the CDC mode in the following scenarios:
+The MySQL connector may need some time to start processing the data in the CDC mode in the following scenarios:
 
 - When the connection is set up for the first time and a snapshot is needed
 - When the connector has a lot of change logs to process
@@ -106,7 +147,7 @@ If you know there are database changes to be synced, but the connector cannot re
 
 ### (Advanced) Set up server timezone
 
-In CDC mode, the MySQl connector may need a timezone configured if the existing MySQL database been set up with a system timezone that is not recognized by the [IANA Timezone Database](https://www.iana.org/time-zones).
+In CDC mode, the MySQL connector may need a timezone configured if the existing MySQL database been set up with a system timezone that is not recognized by the [IANA Timezone Database](https://www.iana.org/time-zones).
 
 In this case, you can configure the server timezone to the equivalent IANA timezone compliant timezone. (e.g. CEST -> Europe/Berlin).
 

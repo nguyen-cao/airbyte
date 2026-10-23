@@ -1,5 +1,5 @@
 ---
-products: oss-community, oss-enterprise
+products: oss-community
 ---
 
 # Custom components for the Connector Builder
@@ -48,7 +48,7 @@ When enabled, Custom Components bring the full flexibility of the Low-Code CDK i
 Custom Components are currently considered **UNSAFE** and **EXPERIMENTAL**. Airbyte doesn't provide any sandboxing guarantees. This feature could execute arbitrary code in your Airbyte environment. Enable it at your own risk.
 :::
 
-Airbyte disables Custom Components by default due to their experimental nature and security implications. Administrators can enable this feature in Self-Managed Community and Self-Managed Enterprise deployments using one of the following methods:
+Airbyte disables Custom Components by default due to their experimental nature and security implications. Administrators can enable this feature in Core deployments using one of the following methods:
 
 ### Using abctl
 
@@ -56,16 +56,16 @@ If you deploy Airbyte with abctl, follow the steps below to update your values a
 
 1. Edit your existing `values.yaml` file or create a new override file with this configuration:
 
-   ```yaml title="values.yaml"
-   workload-launcher:
-     extraEnv:
-       - name: AIRBYTE_ENABLE_UNSAFE_CODE
-         value: "true"
-   connector-builder-server:
-     extraEnv:
-       - name: AIRBYTE_ENABLE_UNSAFE_CODE
-         value: "true"
-   ```
+    ```yaml title="values.yaml"
+    workloadLauncher:
+      extraEnv:
+        - name: AIRBYTE_ENABLE_UNSAFE_CODE
+          value: "true"
+    manifestServer:
+      extraEnv:
+        - name: AIRBYTE_ENABLE_UNSAFE_CODE
+          value: "true"
+    ```
 
 2. Use this file during deployment with the abctl command:
 
@@ -79,22 +79,25 @@ If you're deploying Airbyte using public Helm charts without abctl, follow the s
 
 1. Edit your existing `values.yaml` file or create a new override file with this configuration:
 
-   ```yaml title="values.yaml"
-   workload-launcher:
-     extraEnv:
-       - name: AIRBYTE_ENABLE_UNSAFE_CODE
-         value: "true"
-   connector-builder-server:
-     extraEnv:
-       - name: AIRBYTE_ENABLE_UNSAFE_CODE
-         value: "true"
-   ```
+    ```yaml title="values.yaml"
+    workloadLauncher:
+      extraEnv:
+        - name: AIRBYTE_ENABLE_UNSAFE_CODE
+          value: "true"
+    manifestServer:
+      extraEnv:
+        - name: AIRBYTE_ENABLE_UNSAFE_CODE
+          value: "true"
+    ```
 
 2. Apply the configuration during Helm installation or upgrade:
 
-   ```bash
-   helm upgrade --install airbyte airbyte/airbyte -f values.yaml -f values.yaml
-   ```
+    ```bash
+    helm upgrade airbyte airbyte/airbyte \
+      --namespace airbyte \           # Target Kubernetes namespace
+      --values ./values.yaml \       # Custom configuration values
+      --version 2.x.x                # Helm chart version to use
+    ```
 
 :::caution
 Monitor your deployment for any security or performance issues. Remember that this feature allows execution of arbitrary code in your Airbyte environment.

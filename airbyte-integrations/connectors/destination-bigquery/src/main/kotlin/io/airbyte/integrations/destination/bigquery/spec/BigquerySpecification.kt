@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Airbyte, Inc., all rights reserved.
+ * Copyright (c) 2026 Airbyte, Inc., all rights reserved.
  */
 
 package io.airbyte.integrations.destination.bigquery.spec
@@ -75,31 +75,44 @@ class BigquerySpecification : ConfigurationSpecification() {
     )
     val credentialsJson: String? = null
 
-    @get:JsonSchemaTitle("Transformation Query Run Type")
+    @get:JsonSchemaTitle("Job Execution Project ID")
     @get:JsonPropertyDescription(
-        """Interactive run type means that the query is executed as soon as possible, and these queries count towards concurrent rate limit and daily limit. Read more about interactive run type <a href="https://cloud.google.com/bigquery/docs/running-queries#queries">here</a>. Batch queries are queued and started as soon as idle resources are available in the BigQuery shared resource pool, which usually occurs within a few minutes. Batch queries don’t count towards your concurrent rate limit. Read more about batch queries <a href="https://cloud.google.com/bigquery/docs/running-queries#batch">here</a>. The default "interactive" value is used if not set explicitly.""",
+        """Optional. The GCP project ID where BigQuery jobs will be executed. When set, query jobs run against this project's quota instead of the dataset project's quota. This is useful for isolating BigQuery concurrent query quota between different workloads (e.g. data ingestion vs. analytics). The service account must have BigQuery Job User role on this project. If not set, jobs run in the dataset project (Project ID above).""",
     )
-    @get:JsonProperty("transformation_priority", defaultValue = "interactive")
-    @get:JsonSchemaInject(json = """{"group": "advanced", "order": 5}""")
-    val transformationPriority: TransformationPriority? = null
+    @get:JsonProperty("job_project_id")
+    @get:JsonSchemaInject(json = """{"group": "advanced", "order": 4}""")
+    val jobProjectId: String? = null
 
-    @get:JsonSchemaTitle("Raw Table Dataset Name")
+    @get:JsonSchemaTitle("CDC deletion mode")
     @get:JsonPropertyDescription(
-        """The dataset to write raw tables into (default: airbyte_internal)""",
+        """Whether to execute CDC deletions as hard deletes (i.e. propagate source deletions to the destination), or soft deletes (i.e. leave a tombstone record in the destination). Defaults to hard deletes.""",
     )
-    @get:JsonProperty("raw_data_dataset")
-    @get:JsonSchemaInject(json = """{"group": "advanced", "order": 7}""")
-    val rawTableDataset: String? = null
+    // default hard delete for backwards compatibility
+    @get:JsonProperty("cdc_deletion_mode", defaultValue = "Hard delete")
+    @get:JsonSchemaInject(
+        json = """{"group": "sync_behavior", "order": 5, "always_show": true}""",
+    )
+    val cdcDeletionMode: CdcDeletionMode? = null
 
     @get:JsonSchemaTitle(
-        "Disable Final Tables. (WARNING! Unstable option; Columns in raw table schema might change between versions)",
+        """Legacy raw tables""",
     )
     @get:JsonPropertyDescription(
-        """Disable Writing Final Tables. WARNING! The data format in _airbyte_data is likely stable but there are no guarantees that other metadata columns will remain the same in future versions""",
+        """Write the legacy "raw tables" format, to enable backwards compatibility with older versions of this connector.""",
     )
+    // for compatibility with existing actor configs, we keep the old property name.
     @get:JsonProperty("disable_type_dedupe")
-    @get:JsonSchemaInject(json = """{"group": "advanced", "order": 8, "default": false}""")
-    val disableTypingDeduping: Boolean? = null
+    @get:JsonSchemaInject(json = """{"group": "advanced", "order": 7, "default": false}""")
+    val legacyRawTablesOnly: Boolean? = null
+
+    @get:JsonSchemaTitle("Airbyte Internal Table Dataset Name")
+    @get:JsonPropertyDescription(
+        """Airbyte will use this dataset for various internal tables. In legacy raw tables mode, the raw tables will be stored in this dataset. Defaults to "airbyte_internal".""",
+    )
+    // for backwards compatibility, the JSON property is still called raw_data_dataset.
+    @get:JsonProperty("raw_data_dataset")
+    @get:JsonSchemaInject(json = """{"group": "advanced", "order": 8}""")
+    val internalTableDataset: String? = null
 }
 
 @JsonTypeInfo(
@@ -108,8 +121,8 @@ class BigquerySpecification : ConfigurationSpecification() {
     property = "method",
 )
 @JsonSubTypes(
-    JsonSubTypes.Type(value = BatchedStandardInsertSpecification::class, name = "Standard"),
     JsonSubTypes.Type(value = GcsStagingSpecification::class, name = "GCS Staging"),
+    JsonSubTypes.Type(value = BatchedStandardInsertSpecification::class, name = "Standard"),
 )
 sealed class LoadingMethodSpecification(@JsonProperty("method") val method: LoadingMethod) {
     enum class LoadingMethod(@get:JsonValue val typeName: String) {
@@ -120,14 +133,14 @@ sealed class LoadingMethodSpecification(@JsonProperty("method") val method: Load
 
 @JsonSchemaTitle("Batched Standard Inserts")
 @JsonSchemaDescription(
-    "Direct loading using batched SQL INSERT statements. This method uses the BigQuery driver to convert large INSERT statements into file uploads automatically.",
+    "Simpler setup with no external staging required. Uses the BigQuery SDK to stream data directly. Suitable for smaller data volumes or quick testing.",
 )
 class BatchedStandardInsertSpecification :
     LoadingMethodSpecification(LoadingMethod.BATCHED_STANDARD_INSERT)
 
-@JsonSchemaTitle("GCS Staging")
+@JsonSchemaTitle("GCS Staging (Recommended)")
 @JsonSchemaDescription(
-    "Writes large batches of records to a file, uploads the file to GCS, then uses COPY INTO to load your data into BigQuery.",
+    "Recommended for production workloads. Uploads data to a GCS bucket, then loads it into BigQuery using a COPY job. Provides better performance for large data volumes.",
 )
 class GcsStagingSpecification :
     GcsCommonSpecification, LoadingMethodSpecification(LoadingMethod.GCS) {
@@ -201,7 +214,12 @@ enum class GcsFilePostProcessing(@get:JsonValue val postProcesing: String) {
 
 enum class TransformationPriority(@get:JsonValue val transformationPriority: String) {
     INTERACTIVE("interactive"),
-    BATCH("batch")
+    BATCH("batch"),
+}
+
+enum class CdcDeletionMode(@get:JsonValue val cdcDeletionMode: String) {
+    HARD_DELETE("Hard delete"),
+    SOFT_DELETE("Soft delete"),
 }
 
 @Singleton
@@ -216,6 +234,7 @@ class BigquerySpecificationExtension : DestinationSpecificationExtension {
     override val groups =
         listOf(
             DestinationSpecificationExtension.Group("connection", "Connection"),
+            DestinationSpecificationExtension.Group("sync_behavior", "Sync Behavior"),
             DestinationSpecificationExtension.Group("advanced", "Advanced"),
         )
 }
